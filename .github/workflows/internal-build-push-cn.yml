@@ -86,6 +86,10 @@ env:
   RUSTUP_UPDATE_ROOT: ${{ vars.RUSTUP_UPDATE_ROOT != '' && vars.RUSTUP_UPDATE_ROOT || 'https://rsproxy.cn/rustup' }}
   CARGO_REGISTRY_MIRROR: ${{ vars.CARGO_REGISTRY_MIRROR != '' && vars.CARGO_REGISTRY_MIRROR || 'https://rsproxy.cn' }}
   CUDA_VERSION: '13.0.3'
+  # HuggingFace Hub endpoint — the runner can't reach huggingface.co (kernels
+  # lock/download die with 'Network is unreachable'); route to the China HF
+  # mirror. Empty = huggingface_hub's default (huggingface.co, portable).
+  HF_ENDPOINT: ${{ vars.HF_ENDPOINT != '' && vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
 
 jobs:
   build-push:
@@ -273,6 +277,7 @@ jobs:
             --opt "build-arg:RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}"
             --opt "build-arg:RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}"
             --opt "build-arg:CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}"
+            --opt "build-arg:HF_ENDPOINT=${HF_ENDPOINT}"
             --output "type=image,name=${SHA_IMG},push=true,registry.insecure=true"
             --output "type=image,name=${REF_IMG},push=true,registry.insecure=true"
           )
