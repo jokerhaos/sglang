@@ -1,0 +1,254 @@
+name: Internal Build & Push (CU13)
+
+# Internal build & push pipeline for the domestic-network-only self-hosted
+# cluster. Builds the sglang CU13 image from docker/Dockerfile and pushes it
+# to the internal ZOT registry. Standalone — no Docker Hub / ECR deps.
+#
+# All foreign→domestic mirror routing lives IN docker/Dockerfile as build-args
+# (CUDA_BASE_IMAGE, GITHUB_ARTIFACTORY, GITHUB_RAW_ARTIFACTORY, PYTORCH_INDEX,
+# UBUNTU_MIRROR, PIP_DEFAULT_INDEX). Each defaults to its upstream source so the
+# Dockerfile stays buildable anywhere; CI overrides them to domestic mirrors via
+# --build-arg below. There is NO CI-side Dockerfile rewrite step.
+#
+# IMPORTANT — network assumption: the runner reaches domestic mirrors but mostly
+# not foreign hosts. Base OCI pull is off docker.io via the CUDA_BASE_IMAGE
+# build-arg (pre-mirrored into orc). A few sources have NO public domestic
+# mirror — sh.rustup.rs, just.systems, flashinfer.ai,
+# developer.download.nvidia.com — the build relies on the runner reaching those
+# directly (verified reachable on this cluster). If one ever breaks, stand up an
+# internal mirror and route it through the relevant build-arg.
+#
+# Repo settings (Settings → Secrets and Variables → Actions):
+#   Secrets:    ZOT_USERNAME, ZOT_PASSWORD  (push auth)
+#   Variables (optional; defaults shown — override only if your cluster differs):
+#     ZOT_REGISTRY   = zot.orc-registry.svc.cluster.local:5000   (push target)
+#     ZOT_REPOSITORY = sglang                                  (image namespace)
+#     GH_PROXY       = https://gh-proxy.com                    (full gh-proxy URL; builds GITHUB_RAW_ARTIFACTORY)
+#     GH_PROXY_HOST  = gh-proxy.com                           (host part; used for GITHUB_ARTIFACTORY, where the Dockerfile prepends https://)
+#     BASE_IMAGE_REF = orc.0xtoken.cn/nvidia/cuda              (-> CUDA_BASE_IMAGE build-arg; base/runtime base image)
+#     UBUNTU_MIRROR  = https://mirrors.tuna.tsinghua.edu.cn    (-> UBUNTU_MIRROR build-arg)
+#     PYPI_INDEX     = https://mirrors.aliyun.com/pypi/simple/  (-> PIP_DEFAULT_INDEX build-arg)
+#     PYTORCH_INDEX  = https://mirrors.aliyun.com/pytorch-wheels (no trailing slash; -> PYTORCH_INDEX build-arg)
+#     RUSTUP_DIST_SERVER = https://rsproxy.cn                    (-> RUSTUP_DIST_SERVER build-arg; Rust toolchain download)
+#     RUSTUP_UPDATE_ROOT = https://rsproxy.cn/rustup             (-> RUSTUP_UPDATE_ROOT build-arg)
+#
+# ZOT is plain HTTP on :5000, so auth is written straight to ~/.docker/config.json
+# (docker login would attempt an HTTPS handshake and fail). The buildkitd side
+# must carry the http+insecure registry block (operator-owned BUILDKIT_HOST
+# deployment).
+
+on:
+  push:
+    branches:
+      - main
+      - ci/internal-build-cu13-zot   # TEMPORARY: verify the build on this branch before merging; remove after merge to main
+    paths:
+      - 'docker/**'
+      - 'python/**'
+      - 'rust/**'
+      - '.github/workflows/internal-build-push-cn.yml'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Dockerfile build target (runtime = slim prod, framework_final = full dev)'
+        required: true
+        type: choice
+        default: runtime
+        options:
+          - runtime
+          - framework_final
+      no_cache:
+        description: 'Disable Docker build cache (force fresh layers)'
+        required: false
+        type: boolean
+        default: false
+
+# Avoid duplicate concurrent builds of the same variant on the same ref — let
+# the in-flight one finish (tags are SHA-keyed; a cancelled push can leave a
+# half-pushed tag).
+concurrency:
+  group: internal-build-cn-${{ github.ref }}-${{ inputs.target || 'runtime' }}
+  cancel-in-progress: false
+
+env:
+  ZOT_REGISTRY: ${{ vars.ZOT_REGISTRY != '' && vars.ZOT_REGISTRY || 'zot.orc-registry.svc.cluster.local:5000' }}
+  ZOT_REPOSITORY: ${{ vars.ZOT_REPOSITORY != '' && vars.ZOT_REPOSITORY || 'sglang' }}
+  GH_PROXY: ${{ vars.GH_PROXY != '' && vars.GH_PROXY || 'https://gh-proxy.com' }}
+  GH_PROXY_HOST: ${{ vars.GH_PROXY_HOST != '' && vars.GH_PROXY_HOST || 'gh-proxy.com' }}
+  # Base image pre-mirrored into orc (the cluster's docker.io mirror is not
+  # guaranteed). Passed as the CUDA_BASE_IMAGE build-arg — the Dockerfile's
+  # `ARG CUDA_BASE_IMAGE=nvidia/cuda` (default nvidia/cuda) is overridden here so
+  # the `base` + `runtime` stages pull from orc, keeping the build off docker.io.
+  BASE_IMAGE_REF: ${{ vars.BASE_IMAGE_REF != '' && vars.BASE_IMAGE_REF || 'orc.0xtoken.cn/nvidia/cuda' }}
+  UBUNTU_MIRROR: ${{ vars.UBUNTU_MIRROR != '' && vars.UBUNTU_MIRROR || 'https://mirrors.tuna.tsinghua.edu.cn' }}
+  PYPI_INDEX: ${{ vars.PYPI_INDEX != '' && vars.PYPI_INDEX || 'https://mirrors.aliyun.com/pypi/simple/' }}
+  PYTORCH_INDEX: ${{ vars.PYTORCH_INDEX != '' && vars.PYTORCH_INDEX || 'https://mirrors.aliyun.com/pytorch-wheels' }}
+  RUSTUP_DIST_SERVER: ${{ vars.RUSTUP_DIST_SERVER != '' && vars.RUSTUP_DIST_SERVER || 'https://rsproxy.cn' }}
+  RUSTUP_UPDATE_ROOT: ${{ vars.RUSTUP_UPDATE_ROOT != '' && vars.RUSTUP_UPDATE_ROOT || 'https://rsproxy.cn/rustup' }}
+  CUDA_VERSION: '13.0.3'
+
+jobs:
+  build-push:
+    runs-on: 0xtoken-arc-runner-set
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The domestic runner can't reach github.com directly (an earlier
+          # actions/checkout fetch timed out: "TLS connection non-properly
+          # terminated"). Route git through the domestic gh-proxy — it forwards
+          # Basic auth to github upstream, so the PRIVATE repo clone succeeds.
+          # Keep a persistent shallow mirror under /cache/repos so each run
+          # fetches only the per-commit delta (full clones are slow + the
+          # China↔github link is flaky). The work tree is copied LOCALLY from
+          # the mirror (no 2nd github trip); .git is then dropped so it does not
+          # bloat the docker build context (.dockerignore here == .gitignore,
+          # which doesn't list .git).
+          git config --global --add safe.directory '*'
+          git config --global "url.${GH_PROXY}/https://github.com/".insteadOf "https://github.com/"
+          git config --global http."${GH_PROXY}/https://github.com/".extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
+
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          MIRROR="/cache/repos/${GITHUB_REPOSITORY}"
+          MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}.seed-v1"
+          retry(){ local n; for n in $(seq 1 12); do "$@" && return 0; echo "::warning::attempt $n; sleep $((n*4))"; sleep $((n*4)); done; return 1; }
+
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            mkdir -p "$(dirname "$MIRROR")"
+            # Re-seed only when the mirror (or its version marker) is missing —
+            # the one-time full shallow clone; later runs fetch just the delta.
+            if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
+              echo "::notice::(re)seeding mirror — one-time shallow clone via gh-proxy"
+              rm -rf "$MIRROR"
+              retry git clone --no-tags --depth 1 "$url" "$MIRROR"
+              : > "$MARK"
+            fi
+            # GITHUB_TOKEN is job-scoped + short-lived; refresh origin's URL
+            # with THIS run's token or a stale expired one → auth-fail on fetch.
+            git -C "$MIRROR" remote set-url origin "$url"
+            retry git -C "$MIRROR" fetch --no-tags --depth 1 origin "$GITHUB_SHA"
+            git -C "$MIRROR" checkout -f "$GITHUB_SHA"
+            git -C "$MIRROR" clean -fdxq
+            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+          else
+            echo "no /cache/repos volume — direct shallow clone via gh-proxy"
+            retry git clone --no-tags --depth 1 "$url" "$GITHUB_WORKSPACE"
+          fi
+          rm -rf "$GITHUB_WORKSPACE/.git"
+          echo "checked out ${GITHUB_SHA:0:7} (depth-1, .git stripped)"
+
+      - name: Compute image tags
+        id: tag
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target || 'runtime' }}
+        run: |
+          set -ueo pipefail
+          SHA="${GITHUB_SHA::12}"
+          REF="${GITHUB_REF_NAME}"
+          SAFE_REF="$(printf '%s' "${REF}" | tr -c 'a-zA-Z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
+          [ -z "${SAFE_REF}" ] && SAFE_REF="commit"
+          TAG_NAME="sglang-cu13"
+          [ "${TARGET}" = "runtime" ] || TAG_NAME="${TAG_NAME}-${TARGET}"
+          echo "name=${TAG_NAME}"             >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${TAG_NAME}:${SHA}"    >> "$GITHUB_OUTPUT"
+          echo "ref_tag=${TAG_NAME}:${SAFE_REF}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"                    >> "$GITHUB_OUTPUT"
+
+      - name: Export pod env
+        shell: bash
+        # The ARC runner pod exposes the cluster's remote buildkitd endpoint as
+        # BUILDKIT_HOST. Surface it for docker/setup-buildx-action.
+        run: echo "BUILDKIT_HOST=${BUILDKIT_HOST}" >> "$GITHUB_ENV"
+
+      - name: Configure ZOT registry credentials
+        shell: bash
+        env:
+          ZOT_USERNAME: ${{ secrets.ZOT_USERNAME }}
+          ZOT_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+        run: |
+          set -ueo pipefail
+          if [ -z "${ZOT_USERNAME}" ] || [ -z "${ZOT_PASSWORD}" ]; then
+            echo "::error::ZOT_USERNAME / ZOT_PASSWORD secrets are not set. Add them in repo Settings → Secrets and Variables → Actions."
+            exit 1
+          fi
+          AUTH="$(printf '%s:%s' "${ZOT_USERNAME}" "${ZOT_PASSWORD}" | base64 -w0)"
+          mkdir -p "${HOME}/.docker"
+          cat > "${HOME}/.docker/config.json" <<EOF
+          {
+            "auths": {
+              "${ZOT_REGISTRY}": { "auth": "${AUTH}" }
+            }
+          }
+          EOF
+          chmod 600 "${HOME}/.docker/config.json"
+          echo "Configured auth for ${ZOT_REGISTRY}"
+
+      - name: Set up Buildx (remote buildkitd)
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca  # v3.9.0
+        with:
+          # Cluster-resident buildkitd: its cache lives in the buildkitd volume,
+          # not on the ephemeral runner, so layer cache survives runner teardown.
+          driver: remote
+          endpoint: ${{ env.BUILDKIT_HOST }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75  # v6.9.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          target: ${{ inputs.target || 'runtime' }}
+          tags: |
+            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.sha_tag }}
+            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.ref_tag }}
+          build-args: |
+            CUDA_VERSION=13.0.3
+            CUDA_BASE_IMAGE=${{ env.BASE_IMAGE_REF }}
+            BUILD_TYPE=all
+            BRANCH_TYPE=local
+            GITHUB_ARTIFACTORY=${{ env.GH_PROXY_HOST }}/https://github.com
+            GITHUB_RAW_ARTIFACTORY=${{ env.GH_PROXY_HOST }}/https://raw.githubusercontent.com
+            UBUNTU_MIRROR=${{ env.UBUNTU_MIRROR }}
+            PIP_DEFAULT_INDEX=${{ env.PYPI_INDEX }}
+            PYTORCH_INDEX=${{ env.PYTORCH_INDEX }}
+            RUSTUP_DIST_SERVER=${{ env.RUSTUP_DIST_SERVER }}
+            RUSTUP_UPDATE_ROOT=${{ env.RUSTUP_UPDATE_ROOT }}
+          no-cache: ${{ inputs.no_cache || false }}
+          # Skip provenance/SBOM: they push an extra referrers manifest to ZOT
+          # that older ZOT serves poorly. Plain image is what we want here.
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          PRIMARY: ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.sha_tag }}
+          FLOATING: ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.ref_tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          NAME: ${{ steps.tag.outputs.name }}
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          {
+            echo "### 🐳 Internal image — ${NAME}"
+            echo ""
+            echo "| ref | image |"
+            echo "| --- | --- |"
+            echo "| sha (\`${SHA}\`) | \`${PRIMARY}\` |"
+            echo "| floating (branch/tag) | \`${FLOATING}\` |"
+            [ -n "${DIGEST}" ] && echo "| digest | \`${DIGEST}\` |"
+            echo ""
+            echo "Registry: \`${{ env.ZOT_REGISTRY }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

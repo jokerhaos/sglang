@@ -1,5 +1,9 @@
 ARG CUDA_VERSION=13.0.3
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
+# CI overrides this to a pre-mirrored registry (e.g. orc.0xtoken.cn/nvidia/cuda)
+# so the build doesn't depend on docker.io; defaults to nvidia/cuda so the
+# Dockerfile stays buildable anywhere. Used by the `base` and `runtime` stages.
+ARG CUDA_BASE_IMAGE=nvidia/cuda
+FROM ${CUDA_BASE_IMAGE}:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
@@ -13,6 +17,16 @@ ARG SGL_NCCL_VERSION=2.30.7
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
+# PyTorch wheel index (https://download.pytorch.org/whl/<cuXXX>); CI overrides
+# to a domestic mirror. Default keeps the Dockerfile buildable anywhere.
+ARG PYTORCH_INDEX=https://download.pytorch.org/whl
+# Host serving ohmyzsh's install.sh (raw.githubusercontent.com); CI overrides to
+# a gh-proxy prefix. Default keeps the Dockerfile buildable anywhere.
+ARG GITHUB_RAW_ARTIFACTORY=raw.githubusercontent.com
+# rustup dist/update servers; CI overrides to a domestic rsproxy mirror so the
+# Rust toolchain download doesn't stall on static.rust-lang.org (often blocked).
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.18
 ARG MOONCAKE_VERSION=0.3.13
@@ -26,6 +40,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+# Abort git clones that stall — the gh-proxy git-upload-pack path can stall
+# silently and hang the whole build (>1KB/s floor for 60s, 20s connect).
+# Inherited by every stage that does `git clone`.
+ENV GIT_CONFIG_COUNT=3 \
+    GIT_CONFIG_KEY_0=http.lowSpeedLimit \
+    GIT_CONFIG_VALUE_0=1000 \
+    GIT_CONFIG_KEY_1=http.lowSpeedTime \
+    GIT_CONFIG_VALUE_1=60 \
+    GIT_CONFIG_KEY_2=http.connectTimeout \
+    GIT_CONFIG_VALUE_2=20
+
+# Route rustup through RUSTUP_DIST_SERVER/RUSTUP_UPDATE_ROOT (default upstream;
+# CI sets rsproxy) so the toolchain download doesn't hit blocked hosts.
+# Inherited by torch_deps + gateway_builder (both install Rust).
+ARG RUSTUP_DIST_SERVER
+ARG RUSTUP_UPDATE_ROOT
+ENV RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
@@ -127,7 +160,7 @@ fi
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
-    && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
+    && curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
         https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
@@ -171,13 +204,14 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
+ARG PYTORCH_INDEX
 
 WORKDIR /sgl-workspace
 
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --profile minimal \
     && rustc --version && cargo --version
 
@@ -245,13 +279,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && python3 -m pip install --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
-           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+           python3 -m pip install --index-url ${PYTORCH_INDEX}/cu${CUINDEX} \
                torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --force-reinstall; \
-           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
+           python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -288,6 +322,7 @@ FROM torch_deps AS hpc_ops_builder
 # RoPE kernels from the Tencent Hunyuan AI Infra team, consumed by the opt-in
 # hpc_ops attention and MoE runner backends.
 ARG HPC_OPS_COMMIT=ab1a402724635507037426068f6cddc3d30dc0a8
+ARG GITHUB_ARTIFACTORY
 
 WORKDIR /build
 
@@ -297,7 +332,7 @@ WORKDIR /build
 RUN --mount=type=cache,target=/root/.cache/pip \
     mkdir -p /wheels && \
     if [ "$(uname -m)" = "x86_64" ]; then \
-        git clone https://github.com/Tencent/hpc-ops.git && \
+        git clone https://${GITHUB_ARTIFACTORY}/Tencent/hpc-ops.git && \
         cd hpc-ops && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
@@ -337,6 +372,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 FROM base AS devtools_builder
 
 ARG GITHUB_ARTIFACTORY
+ARG GITHUB_RAW_ARTIFACTORY
 
 WORKDIR /tools
 
@@ -347,15 +383,15 @@ RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # Download CLI tools (each in its own layer for parallel downloads)
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/diff-so-fancy \
+RUN curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -LSso /tools/diff-so-fancy \
         https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
     && chmod +x /tools/diff-so-fancy
 
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/clang-format \
+RUN curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -LSso /tools/clang-format \
         https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /tools/clang-format
 
-RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
+RUN curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL -o /tmp/clangd.zip \
         https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
     && unzip -q /tmp/clangd.zip -d /tmp \
     && cp /tmp/clangd_18.1.3/bin/* /tools/ \
@@ -365,21 +401,21 @@ RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && curl --retry 3 --retry-delay 2 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
+    && curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
         "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "/tmp/${CMAKE_INSTALLER}.tar.gz" -C /tmp \
     && cp -r "/tmp/${CMAKE_INSTALLER}/bin/"* /tools/ \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://just.systems/install.sh | \
     sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
     bash -s -- --tag 1.42.4 --to /tools
 
 # Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+RUN sh -c "$(curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL https://${GITHUB_RAW_ARTIFACTORY}/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+    && git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
+    && git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 ########################################################
 # PARALLEL STAGE 5: Gateway Builder (starts from base)
@@ -400,7 +436,7 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -619,6 +655,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
 
@@ -626,11 +663,11 @@ COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 https://${GITHUB_ARTIFACTORY}/sgl-project/sglang.git /sgl-workspace/sglang; \
     elif [ -z "$SGL_VERSION" ]; then \
         echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
     else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 --branch v${SGL_VERSION} https://${GITHUB_ARTIFACTORY}/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
 
@@ -717,7 +754,7 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 # - Ready-to-run inference server environment
 #
 # Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
+FROM ${CUDA_BASE_IMAGE}:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
