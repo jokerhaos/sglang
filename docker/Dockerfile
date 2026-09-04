@@ -572,6 +572,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    && git config --global url."https://${GITHUB_ARTIFACTORY}/".insteadOf "https://github.com/" \
     && case "${CUDA_VERSION}" in \
            12.*) \
                CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
