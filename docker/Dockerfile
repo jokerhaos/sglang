@@ -361,6 +361,7 @@ FROM torch_deps AS flashinfer_cache
 ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
+ARG GITHUB_ARTIFACTORY=github.com
 
 # Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -371,8 +372,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
-    # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
-    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+    # flashinfer-cubin (0.6.18+) lives ONLY on flashinfer.ai/whl — the domestic
+    # runner can't reach flashinfer.ai (connection-timeout). That PEP503 index
+    # just redirects to GitHub release assets, which the runner CAN reach via
+    # the gh-proxy (CI sets GITHUB_ARTIFACTORY=gh-proxy.com/https://github.com;
+    # default github.com keeps the Dockerfile buildable anywhere). Fetch the
+    # 1.5GB wheel with retries to a local file then `pip install` it so deps
+    # still resolve from the default (aliyun) index. buildkit caches this layer
+    # once it succeeds, so the big download is one-time.
+    && curl --retry 6 --retry-delay 3 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fL \
+        -o /tmp/flashinfer_cubin.whl \
+        "https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
+    && python3 -m pip install /tmp/flashinfer_cubin.whl \
+    && rm -f /tmp/flashinfer_cubin.whl \
     && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin /flashinfer_jit_output/ \
     && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
