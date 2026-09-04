@@ -84,6 +84,7 @@ env:
   PYTORCH_INDEX: ${{ vars.PYTORCH_INDEX != '' && vars.PYTORCH_INDEX || 'https://mirrors.aliyun.com/pytorch-wheels' }}
   RUSTUP_DIST_SERVER: ${{ vars.RUSTUP_DIST_SERVER != '' && vars.RUSTUP_DIST_SERVER || 'https://rsproxy.cn' }}
   RUSTUP_UPDATE_ROOT: ${{ vars.RUSTUP_UPDATE_ROOT != '' && vars.RUSTUP_UPDATE_ROOT || 'https://rsproxy.cn/rustup' }}
+  CARGO_REGISTRY_MIRROR: ${{ vars.CARGO_REGISTRY_MIRROR != '' && vars.CARGO_REGISTRY_MIRROR || 'https://rsproxy.cn' }}
   CUDA_VERSION: '13.0.3'
 
 jobs:
@@ -224,6 +225,7 @@ jobs:
             PYTORCH_INDEX=${{ env.PYTORCH_INDEX }}
             RUSTUP_DIST_SERVER=${{ env.RUSTUP_DIST_SERVER }}
             RUSTUP_UPDATE_ROOT=${{ env.RUSTUP_UPDATE_ROOT }}
+            CARGO_REGISTRY_MIRROR=${{ env.CARGO_REGISTRY_MIRROR }}
           no-cache: ${{ inputs.no_cache || false }}
           # Skip provenance/SBOM: they push an extra referrers manifest to ZOT
           # that older ZOT serves poorly. Plain image is what we want here.

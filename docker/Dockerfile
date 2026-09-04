@@ -27,6 +27,11 @@ ARG GITHUB_RAW_ARTIFACTORY=raw.githubusercontent.com
 # Rust toolchain download doesn't stall on static.rust-lang.org (often blocked).
 ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
 ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+# Cargo registry mirror base (empty = crates.io upstream, portable; CI -> rsproxy
+# so Rust builds don't stall on blocked/slow crates.io). The config.toml written
+# from it is inherited by every stage that runs cargo (gateway_builder's
+# sgl-model-gateway, framework's sglang-grpc extension).
+ARG CARGO_REGISTRY_MIRROR=
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.18
 ARG MOONCAKE_VERSION=0.3.13
@@ -59,6 +64,16 @@ ARG RUSTUP_DIST_SERVER
 ARG RUSTUP_UPDATE_ROOT
 ENV RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
     RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
+
+# Cargo registry mirror — written before rustup installs into /root/.cargo so
+# it survives the install, inherited by all cargo-using stages. Default empty
+# = crates.io (portable); CI sets rsproxy.cn.
+ARG CARGO_REGISTRY_MIRROR
+RUN if [ -n "${CARGO_REGISTRY_MIRROR:-}" ]; then \
+      mkdir -p /root/.cargo && \
+      printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+%s/index/"\n[net]\ngit-fetch-with-cli = true\n' \
+        "${CARGO_REGISTRY_MIRROR}" > /root/.cargo/config.toml; \
+    fi
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
