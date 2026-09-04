@@ -167,7 +167,7 @@ jobs:
       - name: Export pod env
         shell: bash
         # The ARC runner pod exposes the cluster's remote buildkitd endpoint as
-        # BUILDKIT_HOST. Surface it for docker/setup-buildx-action.
+        # BUILDKIT_HOST. Surface it for the buildctl --addr in the build step.
         run: echo "BUILDKIT_HOST=${BUILDKIT_HOST}" >> "$GITHUB_ENV"
 
       - name: Configure ZOT registry credentials
@@ -193,17 +193,45 @@ jobs:
           chmod 600 "${HOME}/.docker/config.json"
           echo "Configured auth for ${ZOT_REGISTRY}"
 
-      # NOTE: this build does NOT use docker/setup-buildx-action or
-      # docker/build-push-action. Those are GitHub Actions `uses:` downloads
-      # fetched at job setup from codeload.github.com — which is the one
-      # github host this domestic runner can't reliably reach (100s timeouts,
-      # verified twice 2026-09-04). The runner image already ships /usr/bin/docker
-      # (v29.x) + the buildx plugin (v0.36.x), so the build runs directly over
-      # the docker CLI — no action tarball download at all. Behavior matches what
-      # build-push-action ran under the hood: same remote buildkitd builder,
-      # same ~/.docker/config.json push auth (forwarded to buildkit in the Solve
-      # request), same --provenance=false/--sbom=false to avoid the extra
-      # referrers manifest ZOT serves poorly.
+      # The build is driven by `buildctl` (moby/buildkit's native client) talking
+      # DIRECTLY to the remote buildkitd at BUILDKIT_HOST — NOT via
+      # docker/setup-buildx-action / docker/build-push-action `uses:` nor via
+      # `docker buildx`. Two reasons, both verified 2026-09-04 on this runner:
+      #   - the docker/* actions are GitHub `uses:` tarballs fetched at job setup
+      #     from codeload.github.com, which this domestic runner can't reliably
+      #     reach (3x 100s timeouts).
+      #   - a plain `docker buildx build --push` with the remote driver wedged on
+      #     a futex at 0% CPU for 2h+ and never opened the solve gRPC; a fresh
+      #     trivial `buildctl build --push` to ZOT succeeded in seconds, so
+      #     buildctl is the more robust path. buildctl reads ~/.docker/config.json
+      #     and forwards the ZOT creds to buildkitd for the push (verified — the
+      #     "[auth] sharing credentials" line in the probe run). buildctl is a
+      #     single static binary fetched once from the gh-proxy GitHub release
+      #     mirror (moby/buildkit v0.33.0, matching buildkitd) and cached under
+      #     ~/.local/bin so later runs skip the download.
+      - name: Install buildctl (cached, via gh-proxy)
+        id: install-buildctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=v0.33.0
+          BIN="$HOME/.local/bin/buildctl-$VER"
+          if [ -x "${BIN}" ]; then
+            echo "buildctl $VER cached at ${BIN}"
+            echo "buildctl=${BIN}" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          mkdir -p "$HOME/.local/bin"
+          URL="${GH_PROXY}/https://github.com/moby/buildkit/releases/download/${VER}/buildkit-${VER}.linux-amd64.tar.gz"
+          for i in $(seq 1 8); do
+            curl -fL --connect-timeout 20 --max-time 240 -o /tmp/bk.tgz "${URL}" && break
+            echo "::warning::buildctl download attempt $i; sleep $((i*3))"; sleep $((i*3))
+          done
+          test -s /tmp/bk.tgz
+          tar -xzf /tmp/bk.tgz -C /tmp bin/buildctl
+          install -m 0755 /tmp/bin/buildctl "${BIN}"
+          "${BIN}" --version
+          echo "buildctl=${BIN}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         id: build
         shell: bash
@@ -212,45 +240,44 @@ jobs:
           NO_CACHE: ${{ inputs.no_cache || false }}
           SHA_TAG: ${{ steps.tag.outputs.sha_tag }}
           REF_TAG: ${{ steps.tag.outputs.ref_tag }}
+          BUILDCTL: ${{ steps.install-buildctl.outputs.buildctl }}
         run: |
-          set -euo pipefail
-          # Remote buildkitd: its cache lives in the buildkitd volume, not on the
-          # ephemeral runner, so layer cache survives runner teardown.
-          docker buildx use remote-bk 2>/dev/null \
-            || docker buildx create --name remote-bk --driver remote "${BUILDKIT_HOST}" --use
-          docker buildx inspect remote-bk --bootstrap >/dev/null
-
-          META="$(mktemp)"
+          set -eo pipefail
+          # Remote buildkitd: its cache lives in the buildkitd volume (survives
+          # runner teardown). buildctl streams the context to buildkitd over the
+          # gRPC Solve; buildkitd does the actual build + the push to ZOT, using
+          # the creds forwarded from ~/.docker/config.json (see the "[auth]
+          # sharing credentials" line). registry.insecure=true = ZOT plain HTTP.
+          NAMES="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG},${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${REF_TAG}"
           ARGS=(
-            docker buildx build
-            --push
+            "${BUILDCTL}" --addr "${BUILDKIT_HOST}" build
+            --frontend dockerfile.v0
+            --local context=.
+            --local dockerfile=docker
             --progress=plain
-            --platform linux/amd64
-            --file docker/Dockerfile
-            --target "${TARGET}"
-            --tag "${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG}"
-            --tag "${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${REF_TAG}"
-            --metadata-file "${META}"
-            --provenance=false
-            --sbom=false
-            --build-arg CUDA_VERSION=13.0.3
-            --build-arg CUDA_BASE_IMAGE=${BASE_IMAGE_REF}
-            --build-arg BUILD_TYPE=all
-            --build-arg BRANCH_TYPE=local
-            --build-arg GITHUB_ARTIFACTORY=${GH_PROXY_HOST}/https://github.com
-            --build-arg GITHUB_RAW_ARTIFACTORY=${GH_PROXY_HOST}/https://raw.githubusercontent.com
-            --build-arg UBUNTU_MIRROR=${UBUNTU_MIRROR}
-            --build-arg PIP_DEFAULT_INDEX=${PYPI_INDEX}
-            --build-arg PYTORCH_INDEX=${PYTORCH_INDEX}
-            --build-arg RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}
-            --build-arg RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
-            --build-arg CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}
+            --opt "platform=linux/amd64"
+            --opt "target=${TARGET}"
+            --opt "build-arg:CUDA_VERSION=13.0.3"
+            --opt "build-arg:CUDA_BASE_IMAGE=${BASE_IMAGE_REF}"
+            --opt "build-arg:BUILD_TYPE=all"
+            --opt "build-arg:BRANCH_TYPE=local"
+            --opt "build-arg:GITHUB_ARTIFACTORY=${GH_PROXY_HOST}/https://github.com"
+            --opt "build-arg:GITHUB_RAW_ARTIFACTORY=${GH_PROXY_HOST}/https://raw.githubusercontent.com"
+            --opt "build-arg:UBUNTU_MIRROR=${UBUNTU_MIRROR}"
+            --opt "build-arg:PIP_DEFAULT_INDEX=${PYPI_INDEX}"
+            --opt "build-arg:PYTORCH_INDEX=${PYTORCH_INDEX}"
+            --opt "build-arg:RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}"
+            --opt "build-arg:RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}"
+            --opt "build-arg:CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}"
+            --output "type=image,name=${NAMES},push=true,registry.insecure=true"
           )
-          [ "${NO_CACHE}" = "true" ] && ARGS+=(--no-cache)
-          "${ARGS[@]}" .
-          DIGEST="$(python3 -c "import json,sys; print(json.load(open('${META}')).get('containerimage.digest',''))" 2>/dev/null || true)"
-          [ -n "${DIGEST}" ] && echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Built + pushed ${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG} ${DIGEST}"
+          [ "${NO_CACHE}" = "true" ] && ARGS+=(--opt "no-cache=true")
+          # Stream progress live to the Actions log; keep a copy for digest grep.
+          "${ARGS[@]}" 2>&1 | tee /tmp/build.log
+          DIGEST="$(grep -m1 'exporting manifest sha256:' /tmp/build.log \
+            | sed -n 's/.*exporting manifest sha256:\([0-9a-f]\{64\}\).*/\1/p' || true)"
+          [ -n "${DIGEST}" ] && echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Built + pushed ${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG} ${DIGEST:+sha256:${DIGEST}}"
 
       - name: Summary
         if: always()
