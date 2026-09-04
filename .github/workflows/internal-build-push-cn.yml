@@ -193,44 +193,64 @@ jobs:
           chmod 600 "${HOME}/.docker/config.json"
           echo "Configured auth for ${ZOT_REGISTRY}"
 
-      - name: Set up Buildx (remote buildkitd)
-        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca  # v3.9.0
-        with:
-          # Cluster-resident buildkitd: its cache lives in the buildkitd volume,
-          # not on the ephemeral runner, so layer cache survives runner teardown.
-          driver: remote
-          endpoint: ${{ env.BUILDKIT_HOST }}
-
+      # NOTE: this build does NOT use docker/setup-buildx-action or
+      # docker/build-push-action. Those are GitHub Actions `uses:` downloads
+      # fetched at job setup from codeload.github.com — which is the one
+      # github host this domestic runner can't reliably reach (100s timeouts,
+      # verified twice 2026-09-04). The runner image already ships /usr/bin/docker
+      # (v29.x) + the buildx plugin (v0.36.x), so the build runs directly over
+      # the docker CLI — no action tarball download at all. Behavior matches what
+      # build-push-action ran under the hood: same remote buildkitd builder,
+      # same ~/.docker/config.json push auth (forwarded to buildkit in the Solve
+      # request), same --provenance=false/--sbom=false to avoid the extra
+      # referrers manifest ZOT serves poorly.
       - name: Build and push image
         id: build
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75  # v6.9.0
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: linux/amd64
-          push: true
-          target: ${{ inputs.target || 'runtime' }}
-          tags: |
-            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.sha_tag }}
-            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.ref_tag }}
-          build-args: |
-            CUDA_VERSION=13.0.3
-            CUDA_BASE_IMAGE=${{ env.BASE_IMAGE_REF }}
-            BUILD_TYPE=all
-            BRANCH_TYPE=local
-            GITHUB_ARTIFACTORY=${{ env.GH_PROXY_HOST }}/https://github.com
-            GITHUB_RAW_ARTIFACTORY=${{ env.GH_PROXY_HOST }}/https://raw.githubusercontent.com
-            UBUNTU_MIRROR=${{ env.UBUNTU_MIRROR }}
-            PIP_DEFAULT_INDEX=${{ env.PYPI_INDEX }}
-            PYTORCH_INDEX=${{ env.PYTORCH_INDEX }}
-            RUSTUP_DIST_SERVER=${{ env.RUSTUP_DIST_SERVER }}
-            RUSTUP_UPDATE_ROOT=${{ env.RUSTUP_UPDATE_ROOT }}
-            CARGO_REGISTRY_MIRROR=${{ env.CARGO_REGISTRY_MIRROR }}
-          no-cache: ${{ inputs.no_cache || false }}
-          # Skip provenance/SBOM: they push an extra referrers manifest to ZOT
-          # that older ZOT serves poorly. Plain image is what we want here.
-          provenance: false
-          sbom: false
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target || 'runtime' }}
+          NO_CACHE: ${{ inputs.no_cache || false }}
+          SHA_TAG: ${{ steps.tag.outputs.sha_tag }}
+          REF_TAG: ${{ steps.tag.outputs.ref_tag }}
+        run: |
+          set -euo pipefail
+          # Remote buildkitd: its cache lives in the buildkitd volume, not on the
+          # ephemeral runner, so layer cache survives runner teardown.
+          docker buildx use remote-bk 2>/dev/null \
+            || docker buildx create --name remote-bk --driver remote "${BUILDKIT_HOST}" --use
+          docker buildx inspect remote-bk --bootstrap >/dev/null
+
+          META="$(mktemp)"
+          ARGS=(
+            docker buildx build
+            --push
+            --progress=plain
+            --platform linux/amd64
+            --file docker/Dockerfile
+            --target "${TARGET}"
+            --tag "${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG}"
+            --tag "${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${REF_TAG}"
+            --metadata-file "${META}"
+            --provenance=false
+            --sbom=false
+            --build-arg CUDA_VERSION=13.0.3
+            --build-arg CUDA_BASE_IMAGE=${BASE_IMAGE_REF}
+            --build-arg BUILD_TYPE=all
+            --build-arg BRANCH_TYPE=local
+            --build-arg GITHUB_ARTIFACTORY=${GH_PROXY_HOST}/https://github.com
+            --build-arg GITHUB_RAW_ARTIFACTORY=${GH_PROXY_HOST}/https://raw.githubusercontent.com
+            --build-arg UBUNTU_MIRROR=${UBUNTU_MIRROR}
+            --build-arg PIP_DEFAULT_INDEX=${PYPI_INDEX}
+            --build-arg PYTORCH_INDEX=${PYTORCH_INDEX}
+            --build-arg RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}
+            --build-arg RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
+            --build-arg CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}
+          )
+          [ "${NO_CACHE}" = "true" ] && ARGS+=(--no-cache)
+          "${ARGS[@]}" .
+          DIGEST="$(python3 -c "import json,sys; print(json.load(open('${META}')).get('containerimage.digest',''))" 2>/dev/null || true)"
+          [ -n "${DIGEST}" ] && echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Built + pushed ${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG} ${DIGEST}"
 
       - name: Summary
         if: always()
