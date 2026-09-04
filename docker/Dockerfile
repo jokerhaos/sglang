@@ -408,9 +408,17 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+# just: fetch the release tarball DIRECTLY via gh-proxy — just.systems (the
+# install.sh host) is unreachable from the CI cluster (SSL connection timeout),
+# has no domestic mirror, and --speed-time doesn't fire on a stuck SSL handshake
+# (no data flows), so the curl idled for hours. The just release tarball on
+# github.com carries the same binary that install.sh would download; pull it
+# through gh-proxy and extract just into /tools. --max-time backstop catches any
+# hung connect.
+RUN mkdir -p /tools && \
+    curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 --max-time 300 -fsSL \
+        "https://${GITHUB_ARTIFACTORY}/casey/just/releases/download/1.42.4/just-1.42.4-$(uname -m)-unknown-linux-musl.tar.gz" \
+        | tar -xzf - -C /tools just
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL https://${GITHUB_RAW_ARTIFACTORY}/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \

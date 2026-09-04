@@ -13,8 +13,7 @@ name: Internal Build & Push (CU13)
 # IMPORTANT — network assumption: the runner reaches domestic mirrors but mostly
 # not foreign hosts. Base OCI pull is off docker.io via the CUDA_BASE_IMAGE
 # build-arg (pre-mirrored into orc). A few sources have NO public domestic
-# mirror — sh.rustup.rs, just.systems, flashinfer.ai,
-# developer.download.nvidia.com — the build relies on the runner reaching those
+# mirror — sh.rustup.rs, flashinfer.ai, developer.download.nvidia.com — the build relies on the runner reaching those
 # directly (verified reachable on this cluster). If one ever breaks, stand up an
 # internal mirror and route it through the relevant build-arg.
 #
