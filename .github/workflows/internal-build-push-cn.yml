@@ -248,7 +248,11 @@ jobs:
           # gRPC Solve; buildkitd does the actual build + the push to ZOT, using
           # the creds forwarded from ~/.docker/config.json (see the "[auth]
           # sharing credentials" line). registry.insecure=true = ZOT plain HTTP.
-          NAMES="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG},${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${REF_TAG}"
+          # buildctl splits `--output` on COMMA, so a single name=t1,t2 is parsed
+          # as two attrs (the 2nd is an invalid key). Multiple tags = multiple
+          # --output flags; buildctl pushes the same solved image under each.
+          SHA_IMG="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG}"
+          REF_IMG="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${REF_TAG}"
           ARGS=(
             "${BUILDCTL}" --addr "${BUILDKIT_HOST}" build
             --frontend dockerfile.v0
@@ -269,7 +273,8 @@ jobs:
             --opt "build-arg:RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}"
             --opt "build-arg:RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}"
             --opt "build-arg:CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}"
-            --output "type=image,name=${NAMES},push=true,registry.insecure=true"
+            --output "type=image,name=${SHA_IMG},push=true,registry.insecure=true"
+            --output "type=image,name=${REF_IMG},push=true,registry.insecure=true"
           )
           [ "${NO_CACHE}" = "true" ] && ARGS+=(--opt "no-cache=true")
           # Stream progress live to the Actions log; keep a copy for digest grep.
