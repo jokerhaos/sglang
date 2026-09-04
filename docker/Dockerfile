@@ -381,10 +381,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     # still resolve from the default (aliyun) index. buildkit caches this layer
     # once it succeeds, so the big download is one-time.
     && curl --retry 6 --retry-delay 3 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fL \
-        -o /tmp/flashinfer_cubin.whl \
+        -o "/tmp/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
         "https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
-    && python3 -m pip install /tmp/flashinfer_cubin.whl \
-    && rm -f /tmp/flashinfer_cubin.whl \
+    && python3 -m pip install "/tmp/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
+    && rm -f "/tmp/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
     && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin /flashinfer_jit_output/ \
     && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
