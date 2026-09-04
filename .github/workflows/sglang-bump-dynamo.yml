@@ -1,0 +1,181 @@
+name: Bump dynamo sglang image
+
+# After a successful CU13 sglang build+push (internal-build-push-cn.yml, on
+# main), open/update a PR on astro-web3/dynamo that re-points the
+# sglang.cuda13.0 runtime image in container/context.yaml at the just-pushed
+# ZOT image, pinned to the build's 12-char SHA. base_image / base_image_tag are
+# left alone (dynamo's own build base).
+#
+# Fixed dynamo branch update-sglang-cu13-image = dynamo/main + this one commit;
+# the branch is reset to main each build, so a single, kept-open PR rolls
+# forward to the latest built image. If the image ref is unchanged the commit/push
+# is skipped (no no-op churn).
+#
+# Cross-repo: runs in astro-web3/sglang but writes astro-web3/dynamo, so it needs
+# a write PAT. Set repo secret:
+#   DYNAMO_BOT_TOKEN  (fine-grained PAT: contents:write + pull-requests:write on
+#   astro-web3/dynamo; classic `repo` scope also works) in astro-web3/sglang.
+#
+# NOTE: only fires once BOTH this workflow AND internal-build-push-cn.yml are on
+# the DEFAULT branch (main) — workflow_run always uses the default-branch copy
+# of this file. Use workflow_dispatch (image_tag input) to test before that.
+
+on:
+  workflow_run:
+    workflows: ["Internal Build & Push (CU13)"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'sglang-cu13 image tag to pin in dynamo context.yaml (e.g. a 12-char sha)'
+        required: true
+        type: string
+
+env:
+  ZOT_REGISTRY: ${{ vars.ZOT_REGISTRY != '' && vars.ZOT_REGISTRY || 'zot.orc-registry.svc.cluster.local:5000' }}
+  ZOT_REPOSITORY: ${{ vars.ZOT_REPOSITORY != '' && vars.ZOT_REPOSITORY || 'sglang' }}
+  GH_PROXY_HOST: ${{ vars.GH_PROXY_HOST != '' && vars.GH_PROXY_HOST || 'gh-proxy.com' }}
+  DYNAMO_REPO: astro-web3/dynamo
+  DYNAMO_BRANCH: update-sglang-cu13-image
+
+jobs:
+  bump-dynamo:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: 0xtoken-arc-runner-set
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve image ref
+        id: ref
+        shell: bash
+        run: |
+          set -ueo pipefail
+          IMAGE="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/sglang-cu13"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.image_tag }}"
+          else
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            TAG="${SHA:0:12}"
+          fi
+          [ -n "${TAG}" ] || { echo "::error::no image tag resolved"; exit 1; }
+          echo "image=${IMAGE}"        >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"            >> "$GITHUB_OUTPUT"
+          echo "full=${IMAGE}:${TAG}"  >> "$GITHUB_OUTPUT"
+
+      - name: Checkout dynamo (cross-repo via gh-proxy, PAT)
+        shell: bash
+        env:
+          PAT: ${{ secrets.DYNAMO_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT}" ]; then echo "::error::DYNAMO_BOT_TOKEN secret not set"; exit 1; fi
+          # The runner can't reach github.com directly — route git through the
+          # domestic gh-proxy (it forwards Basic auth upstream, so a PRIVATE
+          # cross-repo clone works with the PAT).
+          git config --global --add safe.directory '*'
+          git config --global "url.https://${GH_PROXY_HOST}/https://github.com/".insteadOf "https://github.com/"
+          git config --global http."https://${GH_PROXY_HOST}/https://github.com/".extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${PAT}" | base64 -w0)"
+          url="https://x-access-token:${PAT}@github.com/${DYNAMO_REPO}.git"
+          retry(){ local n; for n in $(seq 1 12); do "$@" && return 0; echo "::warning::attempt $n; sleep $((n*4))"; sleep $((n*4)); done; return 1; }
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          retry git clone --no-tags --depth 1 --branch main "$url" "$GITHUB_WORKSPACE"
+          # (Re)create the fixed branch off main.
+          git checkout -B "${DYNAMO_BRANCH}"
+
+      - name: Patch sglang.cuda13.0 runtime image in context.yaml
+        shell: bash
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          TAG: ${{ steps.ref.outputs.tag }}
+        run: |
+          set -ueo pipefail
+          F="container/context.yaml"
+          python3 - "$F" "$IMAGE" "$TAG" <<'PY'
+          import re, sys
+          path, image, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+          s = open(path).read()
+          # Scope edits to the sglang.cuda13.0 block: 4-indented lines between
+          # `sglang:\n  cuda13.0:\n` and the next 2-indent subkey (`  xpu:`) —
+          # leaves the xpu block, base_image*, baseline_sbom, and all comments
+          # untouched. Comment-preserving (no YAML round-trip).
+          m = re.search(r'(^sglang:\n  cuda13\.0:\n)((?:^    .*\n)+)', s, re.M)
+          if not m:
+              sys.exit("::error::sglang.cuda13.0 block not found")
+          block = m.group(2)
+          blk = re.sub(r'^    runtime_image: .*$',  f'    runtime_image: {image}',  block, flags=re.M)
+          blk = re.sub(r'^    runtime_image_tag: .*$', f'    runtime_image_tag: {tag}', blk, flags=re.M)
+          if blk == block:
+              sys.exit("::error::no runtime_image/runtime_image_tag lines replaced")
+          open(path, 'w').write(s[:m.start(2)] + blk + s[m.end(2):])
+          PY
+          echo "--- diff (sglang.cuda13.0) ---"
+          git --no-pager diff -- container/context.yaml | sed -n '1,30p'
+
+      - name: Commit + push (skip if unchanged)
+        id: push
+        shell: bash
+        env:
+          PAT: ${{ secrets.DYNAMO_BOT_TOKEN }}
+        run: |
+          set -ueo pipefail
+          git config user.name  "sglang-ci[bot]"
+          git config user.email "sglang-ci[bot]@users.noreply.github.com"
+          if git diff --quiet -- container/context.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::context.yaml already at this image; nothing to push."
+            exit 0
+          fi
+          git add container/context.yaml
+          git commit -q -m "ci(sglang): bump runtime image to ${{ steps.ref.outputs.full }}"
+          git push --force "https://x-access-token:${PAT}@github.com/${DYNAMO_REPO}.git" \
+            "${DYNAMO_BRANCH}:${DYNAMO_BRANCH}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or reuse the PR (API direct — api.github.com is reachable)
+        if: steps.push.outputs.changed == 'true'
+        shell: bash
+        env:
+          PAT: ${{ secrets.DYNAMO_BOT_TOKEN }}
+          FULL: ${{ steps.ref.outputs.full }}
+        run: |
+          set -ueo pipefail
+          # If an open PR already tracks this branch, the force-push already
+          # rolled it forward — leave it. Otherwise create it.
+          api="https://api.github.com/repos/${DYNAMO_REPO}"
+          hdr=(-H "Authorization: token ${PAT}" -H "Accept: application/vnd.github+json")
+          existing=$(curl -fsSL "${hdr[@]}" \
+            "${api}/pulls?state=open&head=astro-web3:${DYNAMO_BRANCH}&per_page=1" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['number'] if d else '')" 2>/dev/null || true)
+          if [ -n "${existing}" ]; then
+            echo "::notice::open PR #${existing} on ${DYNAMO_REPO} already tracks ${DYNAMO_BRANCH}; updated by the push."
+            exit 0
+          fi
+          body="$(cat <<EOF
+          Built by \`Internal Build & Push (CU13)\` on main and pushed to ZOT.
+
+          - \`sglang.cuda13.0.runtime_image\`     → \`${FULL%:*}\`
+          - \`sglang.cuda13.0.runtime_image_tag\` → \`${FULL##*:}\`
+
+          \`base_image\` / \`base_image_tag\` left unchanged (dynamo's own build base).
+          The branch \`${DYNAMO_BRANCH}\` is reset to main + this single commit each build, so this PR tracks the latest built image.
+          EOF
+          )"
+          python3 -c "import json,sys; print(json.dumps({'title':'ci(sglang): bump sglang runtime image to ${FULL}','head':'${DYNAMO_BRANCH}','base':'main','body':sys.argv[1]}))" "$body" \
+            | curl -fsSL -X POST "${hdr[@]}" "${api}/pulls" -d @- \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('PR #' + str(d.get('number')) + ': ' + d.get('html_url',''))"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Bump dynamo sglang image"
+            echo ""
+            echo "- image: \`${{ steps.ref.outputs.full }}\`"
+            echo "- dynamo branch: \`${DYNAMO_BRANCH}\` (off current main)"
+            echo "- pushed: \`${{ steps.push.outputs.changed }}\`"
+            echo "- repo: https://github.com/${DYNAMO_REPO}"
+          } >> "$GITHUB_STEP_SUMMARY"
