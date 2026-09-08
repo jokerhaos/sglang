@@ -347,7 +347,7 @@ WORKDIR /build
 RUN --mount=type=cache,target=/root/.cache/pip \
     mkdir -p /wheels && \
     if [ "$(uname -m)" = "x86_64" ]; then \
-        git clone https://${GITHUB_ARTIFACTORY}/Tencent/hpc-ops.git && \
+        n=0; until git clone https://${GITHUB_ARTIFACTORY}/Tencent/hpc-ops.git; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "hpc-ops clone attempt $n failed (gh-proxy anon git-upload-pack 403 transient), retry in $((n*4))s"; rm -rf hpc-ops; sleep $((n*4)); done && \
         cd hpc-ops && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
@@ -449,8 +449,8 @@ RUN mkdir -p /tools && \
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL https://${GITHUB_RAW_ARTIFACTORY}/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+    && { n=0; until git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "zsh-autosuggestions clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"; sleep $((n*4)); done; } \
+    && { n=0; until git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "zsh-syntax-highlighting clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"; sleep $((n*4)); done; }
 
 ########################################################
 # PARALLEL STAGE 5: Gateway Builder (starts from base)
