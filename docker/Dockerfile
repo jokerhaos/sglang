@@ -583,7 +583,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    n=0; until git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp; do \
+        n=$((n+1)); [ $n -ge 8 ] && exit 1; \
+        echo "mscclpp clone attempt $n failed (gh-proxy anon git-upload-pack 403 is transient), retrying in $((n*4))s"; \
+        rm -rf /tmp/mscclpp; sleep $((n*4)); \
+    done \
     && git config --global url."https://${GITHUB_ARTIFACTORY}/".insteadOf "https://github.com/" \
     && case "${CUDA_VERSION}" in \
            12.*) \
