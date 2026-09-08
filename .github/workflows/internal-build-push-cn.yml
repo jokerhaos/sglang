@@ -40,7 +40,6 @@ on:
   push:
     branches:
       - main
-      - ci/internal-build-cu13-zot   # TEMPORARY: verify the build on this branch before merging; remove after merge to main
     paths:
       - 'docker/**'
       - 'python/**'
