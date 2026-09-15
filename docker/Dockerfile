@@ -20,9 +20,6 @@ ARG GITHUB_ARTIFACTORY=github.com
 # PyTorch wheel index (https://download.pytorch.org/whl/<cuXXX>); CI overrides
 # to a domestic mirror. Default keeps the Dockerfile buildable anywhere.
 ARG PYTORCH_INDEX=https://download.pytorch.org/whl
-# Host serving ohmyzsh's install.sh (raw.githubusercontent.com); CI overrides to
-# a gh-proxy prefix. Default keeps the Dockerfile buildable anywhere.
-ARG GITHUB_RAW_ARTIFACTORY=raw.githubusercontent.com
 # rustup dist/update servers; CI overrides to a domestic rsproxy mirror so the
 # Rust toolchain download doesn't stall on static.rust-lang.org (often blocked).
 ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
@@ -48,14 +45,23 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Abort git clones that stall — the gh-proxy git-upload-pack path can stall
 # silently and hang the whole build (>1KB/s floor for 60s, 20s connect).
-# Inherited by every stage that does `git clone`.
-ENV GIT_CONFIG_COUNT=3 \
+# Also rewrite EVERY https://github.com/ git URL through the gh-proxy so any
+# git clone inside any stage (devtools' oh-my-zsh, framework's mscclpp
+# FetchContent, framework_final's sglang clone, ...) reaches github via the
+# domestic proxy the runner CAN reach, instead of stalling on github.com.
+# Default GITHUB_ARTIFACTORY=github.com makes this a harmless self-rewrite;
+# CI sets it to gh-proxy.com/https://github.com. Set via env (not `git config`)
+# so it applies before git is installed in any stage and needs no extra layers.
+# Inherited by every stage that runs git.
+ENV GIT_CONFIG_COUNT=4 \
     GIT_CONFIG_KEY_0=http.lowSpeedLimit \
     GIT_CONFIG_VALUE_0=1000 \
     GIT_CONFIG_KEY_1=http.lowSpeedTime \
     GIT_CONFIG_VALUE_1=60 \
     GIT_CONFIG_KEY_2=http.connectTimeout \
-    GIT_CONFIG_VALUE_2=20
+    GIT_CONFIG_VALUE_2=20 \
+    GIT_CONFIG_KEY_3=url.https://${GITHUB_ARTIFACTORY}/.insteadOf \
+    GIT_CONFIG_VALUE_3=https://github.com/
 
 # Route rustup through RUSTUP_DIST_SERVER/RUSTUP_UPDATE_ROOT (default upstream;
 # CI sets rsproxy) so the toolchain download doesn't hit blocked hosts.
@@ -269,6 +275,7 @@ COPY proto                 /tmp/sglang_deps/proto
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     case "$CUDA_VERSION" in \
         12.6.3) CUINDEX=126 ;; \
         12.9.2) CUINDEX=129 ;; \
@@ -399,7 +406,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 FROM base AS devtools_builder
 
 ARG GITHUB_ARTIFACTORY
-ARG GITHUB_RAW_ARTIFACTORY
 
 WORKDIR /tools
 
@@ -447,8 +453,20 @@ RUN mkdir -p /tools && \
         "https://${GITHUB_ARTIFACTORY}/casey/just/releases/download/1.42.4/just-1.42.4-$(uname -m)-unknown-linux-musl.tar.gz" \
         | tar -xzf - -C /tools just
 
-# Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL https://${GITHUB_RAW_ARTIFACTORY}/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+# Install oh-my-zsh + plugins by cloning the repos directly through the
+# gh-proxy. We deliberately do NOT run ohmyzsh/tools/install.sh: it fetches the
+# core repo via a hardcoded `git fetch https://github.com/ohmyzsh/ohmyzsh.git`
+# (REMOTE defaults to that exact URL), which the domestic runner cannot reach
+# — the clone stalls until http.lowSpeedLimit aborts it ("Operation too slow.
+# Less than 1000 bytes/sec transferred the last 60 seconds", run 34221793092),
+# and being inside install.sh it can't be wrapped in a retry. install.sh's
+# other work (write a .zshrc template, chsh) is irrelevant here: the final
+# stage COPYs its own .zshrc, and `source $ZSH/oh-my-zsh.sh` only needs the repo
+# files. Cloning into /root/.oh-my-zsh reproduces install.sh's layout exactly;
+# plugins go to custom/plugins (matching docker/configs/.zshrc). Each clone is
+# wrapped in the same gh-proxy retry loop as mscclpp/hpc-ops (gh-proxy anon
+# git-upload-pack intermittently 403s, per-IP rate limit).
+RUN { n=0; until git clone --depth=1 https://${GITHUB_ARTIFACTORY}/ohmyzsh/ohmyzsh.git /root/.oh-my-zsh; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "oh-my-zsh clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf /root/.oh-my-zsh; sleep $((n*4)); done; } \
     && { n=0; until git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "zsh-autosuggestions clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"; sleep $((n*4)); done; } \
     && { n=0; until git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "zsh-syntax-highlighting clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"; sleep $((n*4)); done; }
 
@@ -471,6 +489,8 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
@@ -479,7 +499,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
     && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+    # /root/.cargo/{registry,git} are cache mounts (excluded from the layer) —
+    # keep them. Only remove the rustup toolchain + its bin/ symlinks so the
+    # exported stage layer stays small. `rm -rf /root/.cargo` would wipe the
+    # cache mounts and force a full crate re-download next build.
+    && rm -rf /root/.rustup /root/.cargo/bin /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
 
 ########################################################
 ########## Final Framework Image ######################
@@ -719,6 +743,8 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Editable install (fast - dependencies already installed via constraints)
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     cd /sgl-workspace/sglang \
     && if [ -n "${HF_ENDPOINT:-}" ]; then export HF_ENDPOINT; fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \

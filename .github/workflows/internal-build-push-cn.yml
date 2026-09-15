@@ -5,7 +5,7 @@ name: Internal Build & Push (CU13)
 # to the internal ZOT registry. Standalone — no Docker Hub / ECR deps.
 #
 # All foreign→domestic mirror routing lives IN docker/Dockerfile as build-args
-# (CUDA_BASE_IMAGE, GITHUB_ARTIFACTORY, GITHUB_RAW_ARTIFACTORY, PYTORCH_INDEX,
+# (CUDA_BASE_IMAGE, GITHUB_ARTIFACTORY, PYTORCH_INDEX,
 # UBUNTU_MIRROR, PIP_DEFAULT_INDEX). Each defaults to its upstream source so the
 # Dockerfile stays buildable anywhere; CI overrides them to domestic mirrors via
 # --build-arg below. There is NO CI-side Dockerfile rewrite step.
@@ -22,7 +22,7 @@ name: Internal Build & Push (CU13)
 #   Variables (optional; defaults shown — override only if your cluster differs):
 #     ZOT_REGISTRY   = zot.orc-registry.svc.cluster.local:5000   (push target)
 #     ZOT_REPOSITORY = sglang                                  (image namespace)
-#     GH_PROXY       = https://gh-proxy.com                    (full gh-proxy URL; builds GITHUB_RAW_ARTIFACTORY)
+#     GH_PROXY       = https://gh-proxy.com                    (full gh-proxy URL; used by the runner git checkout)
 #     GH_PROXY_HOST  = gh-proxy.com                           (host part; used for GITHUB_ARTIFACTORY, where the Dockerfile prepends https://)
 #     BASE_IMAGE_REF = orc.0xtoken.cn/nvidia/cuda              (-> CUDA_BASE_IMAGE build-arg; base/runtime base image)
 #     UBUNTU_MIRROR  = https://mirrors.tuna.tsinghua.edu.cn    (-> UBUNTU_MIRROR build-arg)
@@ -89,6 +89,12 @@ env:
   # lock/download die with 'Network is unreachable'); route to the China HF
   # mirror. Empty = huggingface_hub's default (huggingface.co, portable).
   HF_ENDPOINT: ${{ vars.HF_ENDPOINT != '' && vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
+  # Mirror BuildKit's layer cache into the ZOT registry so a cold buildkitd
+  # (volume lost, pod reschedule) reuses prior layers instead of rebuilding
+  # from scratch. On by default; if a build fails at the cache-export step
+  # (ZOT rejecting BuildKit's OCI cache manifest), flip this to false in repo
+  # Settings → Variables (no code change). Also auto-disabled under no_cache.
+  USE_REGISTRY_CACHE: ${{ vars.USE_REGISTRY_CACHE != '' && vars.USE_REGISTRY_CACHE || 'true' }}
 
 jobs:
   build-push:
@@ -256,6 +262,10 @@ jobs:
           # --output flags; buildctl pushes the same solved image under each.
           SHA_IMG="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${SHA_TAG}"
           REF_IMG="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/${REF_TAG}"
+          # BuildKit layer cache mirrored into ZOT (behind USE_REGISTRY_CACHE,
+          # see env block). mode=max caches intermediate stages too, so
+          # switching build targets (runtime ↔ framework_final) stays warm.
+          CACHE_REF="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/buildcache:cu13"
           ARGS=(
             "${BUILDCTL}" --addr "${BUILDKIT_HOST}" build
             --frontend dockerfile.v0
@@ -269,7 +279,6 @@ jobs:
             --opt "build-arg:BUILD_TYPE=all"
             --opt "build-arg:BRANCH_TYPE=local"
             --opt "build-arg:GITHUB_ARTIFACTORY=${GH_PROXY_HOST}/https://github.com"
-            --opt "build-arg:GITHUB_RAW_ARTIFACTORY=${GH_PROXY_HOST}/https://raw.githubusercontent.com"
             --opt "build-arg:UBUNTU_MIRROR=${UBUNTU_MIRROR}"
             --opt "build-arg:PIP_DEFAULT_INDEX=${PYPI_INDEX}"
             --opt "build-arg:PYTORCH_INDEX=${PYTORCH_INDEX}"
@@ -281,6 +290,12 @@ jobs:
             --output "type=image,name=${REF_IMG},push=true,registry.insecure=true"
           )
           [ "${NO_CACHE}" = "true" ] && ARGS+=(--opt "no-cache=true")
+          if [ "${USE_REGISTRY_CACHE}" = "true" ] && [ "${NO_CACHE}" != "true" ]; then
+            ARGS+=(
+              --import-cache "type=registry,ref=${CACHE_REF},registry.insecure=true"
+              --export-cache "type=registry,ref=${CACHE_REF},mode=max,registry.insecure=true"
+            )
+          fi
           # Stream progress live to the Actions log; keep a copy for digest grep.
           "${ARGS[@]}" 2>&1 | tee /tmp/build.log
           DIGEST="$(grep -m1 'exporting manifest sha256:' /tmp/build.log \
