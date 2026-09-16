@@ -31,7 +31,17 @@ ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 ARG CARGO_REGISTRY_MIRROR=
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.18
-ARG MOONCAKE_VERSION=0.3.13
+# Keep in sync with what the MOONCAKE_FIND_LINKS page hosts: ==0.3.13 does NOT
+# match a 0.3.13.post1 wheel (PEP 440 post-release is a distinct version).
+ARG MOONCAKE_VERSION=0.3.13.post1
+# Find-links page serving the mooncake-transfer-engine-cuda13 wheels (internal
+# MinIO). Empty = install straight from the pip index (portable default). When
+# set, the CU13 install resolves from this page ONLY (--no-index --find-links)
+# so the wheel never silently falls back to the pip mirror; mooncake's runtime
+# deps (aiohttp/requests/msgpack) are sglang core deps, already installed by
+# torch_deps at this point, so --no-index can't strand them. Requires a
+# cp312-labeled wheel on the page — the image runs Python 3.12.
+ARG MOONCAKE_FIND_LINKS=
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -520,6 +530,7 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
+ARG MOONCAKE_FIND_LINKS
 ARG MSCCLPP_VERSION
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
@@ -596,11 +607,14 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 # Python packages and tools (before source copy for better caching)
 # =============================================================================
 
-# Install Mooncake
+# Install Mooncake (CU13 wheels come from the internal find-links page only —
+# see MOONCAKE_FIND_LINKS above; the cuda12 fallback stays on the pip index)
 RUN --mount=type=cache,target=/root/.cache/pip \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+    FL= && \
+    if [ -n "${MOONCAKE_FIND_LINKS}" ]; then FL="--no-index --find-links ${MOONCAKE_FIND_LINKS}"; fi && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
+        python3 -m pip install ${FL} mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
     else \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi

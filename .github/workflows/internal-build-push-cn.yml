@@ -28,6 +28,9 @@ name: Internal Build & Push (CU13)
 #     UBUNTU_MIRROR  = https://mirrors.tuna.tsinghua.edu.cn    (-> UBUNTU_MIRROR build-arg)
 #     PYPI_INDEX     = https://mirrors.aliyun.com/pypi/simple/  (-> PIP_DEFAULT_INDEX build-arg)
 #     PYTORCH_INDEX  = https://mirrors.aliyun.com/pytorch-wheels (no trailing slash; -> PYTORCH_INDEX build-arg)
+#     MOONCAKE_FIND_LINKS = https://minio.0xtoken.cn/python-packages/simple/mooncake-transfer-engine-cuda13/index.html
+#                        (-> MOONCAKE_FIND_LINKS build-arg; internal MinIO page serving the mooncake
+#                         wheels the image runs Python 3.12 — the page must host a cp312 wheel)
 #     RUSTUP_DIST_SERVER = https://rsproxy.cn                    (-> RUSTUP_DIST_SERVER build-arg; Rust toolchain download)
 #     RUSTUP_UPDATE_ROOT = https://rsproxy.cn/rustup             (-> RUSTUP_UPDATE_ROOT build-arg)
 #
@@ -81,6 +84,10 @@ env:
   UBUNTU_MIRROR: ${{ vars.UBUNTU_MIRROR != '' && vars.UBUNTU_MIRROR || 'https://mirrors.tuna.tsinghua.edu.cn' }}
   PYPI_INDEX: ${{ vars.PYPI_INDEX != '' && vars.PYPI_INDEX || 'https://mirrors.aliyun.com/pypi/simple/' }}
   PYTORCH_INDEX: ${{ vars.PYTORCH_INDEX != '' && vars.PYTORCH_INDEX || 'https://mirrors.aliyun.com/pytorch-wheels' }}
+  # Mooncake wheels are pulled from the internal MinIO find-links page, NOT the
+  # pip mirror (Dockerfile installs with --no-index --find-links, so a missing
+  # or Python-tag-incompatible wheel on this page fails the build loudly).
+  MOONCAKE_FIND_LINKS: ${{ vars.MOONCAKE_FIND_LINKS != '' && vars.MOONCAKE_FIND_LINKS || 'https://minio.0xtoken.cn/python-packages/simple/mooncake-transfer-engine-cuda13/index.html' }}
   RUSTUP_DIST_SERVER: ${{ vars.RUSTUP_DIST_SERVER != '' && vars.RUSTUP_DIST_SERVER || 'https://rsproxy.cn' }}
   RUSTUP_UPDATE_ROOT: ${{ vars.RUSTUP_UPDATE_ROOT != '' && vars.RUSTUP_UPDATE_ROOT || 'https://rsproxy.cn/rustup' }}
   CARGO_REGISTRY_MIRROR: ${{ vars.CARGO_REGISTRY_MIRROR != '' && vars.CARGO_REGISTRY_MIRROR || 'https://rsproxy.cn' }}
@@ -282,6 +289,7 @@ jobs:
             --opt "build-arg:UBUNTU_MIRROR=${UBUNTU_MIRROR}"
             --opt "build-arg:PIP_DEFAULT_INDEX=${PYPI_INDEX}"
             --opt "build-arg:PYTORCH_INDEX=${PYTORCH_INDEX}"
+            --opt "build-arg:MOONCAKE_FIND_LINKS=${MOONCAKE_FIND_LINKS}"
             --opt "build-arg:RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}"
             --opt "build-arg:RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}"
             --opt "build-arg:CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}"
