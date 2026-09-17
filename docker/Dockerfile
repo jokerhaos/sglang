@@ -50,6 +50,14 @@ ARG MOONCAKE_FIND_LINKS=
 # sgl-deep-ep.Dockerfile:12.
 ARG TORCH_VERSION=2.13.0
 ARG TORCHAUDIO_VERSION=2.11.0
+# Find-links page serving the CU13 heavy wheels (torch + torchvision + torchaudio
+# + triton + sgl-kernel + the nvidia-*-cu13 family, hosted on the internal
+# MinIO). Empty = plain pip index install (portable default). When set, the
+# heavy preinstall and sgl-kernel layers pull their wheels from this page
+# (several MB/s over LAN instead of the ~0.5 MB/s public-mirror throttle);
+# the configured index remains available as a fallback for anything missing,
+# so the page doesn't have to be exhaustive.
+ARG HEAVY_FIND_LINKS=
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -246,6 +254,7 @@ ARG GITHUB_ARTIFACTORY
 ARG PYTORCH_INDEX
 ARG TORCH_VERSION
 ARG TORCHAUDIO_VERSION
+ARG HEAVY_FIND_LINKS
 
 WORKDIR /sgl-workspace
 
@@ -272,12 +281,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.3) CUINDEX=130 ;; \
         *) echo "heavy preinstall skipped for CUDA=$CUDA_VERSION"; exit 0 ;; \
     esac \
-    && python3 -m pip install --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} \
+    && FL= && \
+    if [ -n "${HEAVY_FIND_LINKS}" ]; then FL="--find-links ${HEAVY_FIND_LINKS}"; fi && \
+    python3 -m pip install ${FL} --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} \
         "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" "torchvision"
 
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    && FL= && \
+    if [ -n "${HEAVY_FIND_LINKS}" ]; then FL="--find-links ${HEAVY_FIND_LINKS}"; fi \
     && case "$CUDA_VERSION" in \
         12.6.3) CUINDEX=126 ;; \
         12.9.2) CUINDEX=129 ;; \
@@ -292,7 +305,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
+        python3 -m pip install ${FL} sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \

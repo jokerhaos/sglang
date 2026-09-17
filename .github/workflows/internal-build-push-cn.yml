@@ -26,11 +26,17 @@ name: Internal Build & Push (CU13)
 #     GH_PROXY_HOST  = gh-proxy.com                           (host part; used for GITHUB_ARTIFACTORY, where the Dockerfile prepends https://)
 #     BASE_IMAGE_REF = orc.0xtoken.cn/nvidia/cuda              (-> CUDA_BASE_IMAGE build-arg; base/runtime base image)
 #     UBUNTU_MIRROR  = https://mirrors.tuna.tsinghua.edu.cn    (-> UBUNTU_MIRROR build-arg)
-#     PYPI_INDEX     = https://mirrors.aliyun.com/pypi/simple/  (-> PIP_DEFAULT_INDEX build-arg)
+#     PYPI_INDEX     = https://mirrors.cloud.tencent.com/pypi/simple/  (-> PIP_DEFAULT_INDEX build-arg; tencent mirrors
+#                       give ~5-6x the single-connection throughput of aliyun for big NVIDIA/torch wheels —
+#                       aliyun throttles anonymous downloads of large files to ~0.5 MB/s)
 #     PYTORCH_INDEX  = https://mirrors.aliyun.com/pytorch-wheels (no trailing slash; -> PYTORCH_INDEX build-arg)
 #     MOONCAKE_FIND_LINKS = https://minio.0xtoken.cn/python-packages/simple/mooncake-transfer-engine-cuda13/index.html
 #                        (-> MOONCAKE_FIND_LINKS build-arg; internal MinIO page serving the mooncake
 #                         wheels the image runs Python 3.12 — the page must host a cp312 wheel)
+#     HEAVY_FIND_LINKS = https://minio.0xtoken.cn/python-packages/simple/cu13-heavy/index.html
+#                       (-> HEAVY_FIND_LINKS build-arg; internal MinIO page serving the CU13 heavy wheels —
+#                        torch/torchvision/torchaudio/triton/sgl-kernel/nvidia-*-cu13 — pulled by the heavy
+#                        preinstall + sgl-kernel layers at LAN speed; index stays as fallback)
 #     RUSTUP_DIST_SERVER = https://rsproxy.cn                    (-> RUSTUP_DIST_SERVER build-arg; Rust toolchain download)
 #     RUSTUP_UPDATE_ROOT = https://rsproxy.cn/rustup             (-> RUSTUP_UPDATE_ROOT build-arg)
 #
@@ -82,12 +88,15 @@ env:
   # the `base` + `runtime` stages pull from orc, keeping the build off docker.io.
   BASE_IMAGE_REF: ${{ vars.BASE_IMAGE_REF != '' && vars.BASE_IMAGE_REF || 'orc.0xtoken.cn/nvidia/cuda' }}
   UBUNTU_MIRROR: ${{ vars.UBUNTU_MIRROR != '' && vars.UBUNTU_MIRROR || 'https://mirrors.tuna.tsinghua.edu.cn' }}
-  PYPI_INDEX: ${{ vars.PYPI_INDEX != '' && vars.PYPI_INDEX || 'https://mirrors.aliyun.com/pypi/simple/' }}
+  PYPI_INDEX: ${{ vars.PYPI_INDEX != '' && vars.PYPI_INDEX || 'https://mirrors.cloud.tencent.com/pypi/simple/' }}
   PYTORCH_INDEX: ${{ vars.PYTORCH_INDEX != '' && vars.PYTORCH_INDEX || 'https://mirrors.aliyun.com/pytorch-wheels' }}
   # Mooncake wheels are pulled from the internal MinIO find-links page, NOT the
   # pip mirror (Dockerfile installs with --no-index --find-links, so a missing
   # or Python-tag-incompatible wheel on this page fails the build loudly).
   MOONCAKE_FIND_LINKS: ${{ vars.MOONCAKE_FIND_LINKS != '' && vars.MOONCAKE_FIND_LINKS || 'https://minio.0xtoken.cn/python-packages/simple/mooncake-transfer-engine-cuda13/index.html' }}
+  # CU13 heavy wheels (torch/torchvision/torchaudio/triton/sgl-kernel/nvidia-*-cu13)
+  # served from the internal MinIO at LAN speed; pip index remains the fallback.
+  HEAVY_FIND_LINKS: ${{ vars.HEAVY_FIND_LINKS != '' && vars.HEAVY_FIND_LINKS || 'https://minio.0xtoken.cn/python-packages/simple/cu13-heavy/index.html' }}
   RUSTUP_DIST_SERVER: ${{ vars.RUSTUP_DIST_SERVER != '' && vars.RUSTUP_DIST_SERVER || 'https://rsproxy.cn' }}
   RUSTUP_UPDATE_ROOT: ${{ vars.RUSTUP_UPDATE_ROOT != '' && vars.RUSTUP_UPDATE_ROOT || 'https://rsproxy.cn/rustup' }}
   CARGO_REGISTRY_MIRROR: ${{ vars.CARGO_REGISTRY_MIRROR != '' && vars.CARGO_REGISTRY_MIRROR || 'https://rsproxy.cn' }}
@@ -290,6 +299,7 @@ jobs:
             --opt "build-arg:PIP_DEFAULT_INDEX=${PYPI_INDEX}"
             --opt "build-arg:PYTORCH_INDEX=${PYTORCH_INDEX}"
             --opt "build-arg:MOONCAKE_FIND_LINKS=${MOONCAKE_FIND_LINKS}"
+            --opt "build-arg:HEAVY_FIND_LINKS=${HEAVY_FIND_LINKS}"
             --opt "build-arg:RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}"
             --opt "build-arg:RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}"
             --opt "build-arg:CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}"
