@@ -329,21 +329,23 @@ jobs:
           # operation that takes seconds — replacing what used to be a second
           # full buildkit image export (~10min) for the 2nd tag.
           REPO_NAME="${ZOT_REPOSITORY}/${SHA_TAG%%:*}"   # e.g. sglang/sglang-cu13 (namespace/repository)
+          SHA_REF="${SHA_TAG##*:}"                       # tag-only, e.g. 6ed018f1d56f
+          REF_REF="${REF_TAG##*:}"                       # e.g. ci-internal-build-cu13-zot
           ACCEPT_H="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
           CT="$(curl -fsS -u "${ZOT_USERNAME}:${ZOT_PASSWORD}" -o /tmp/ref-manifest.json -D - \
                 -H "${ACCEPT_H}" \
-                "http://${ZOT_REGISTRY}/v2/${REPO_NAME}/manifests/${SHA_TAG}" \
+                "http://${ZOT_REGISTRY}/v2/${REPO_NAME}/manifests/${SHA_REF}" \
                 | tr -d '\r' | sed -n 's/^Content-Type:[[:space:]]*//Ip' | head -1)"
           test -s /tmp/ref-manifest.json && test -n "${CT}"
           curl -fsS -X PUT -u "${ZOT_USERNAME}:${ZOT_PASSWORD}" \
                 -H "Content-Type: ${CT}" --data-binary @/tmp/ref-manifest.json \
                 -o /dev/null \
-                "http://${ZOT_REGISTRY}/v2/${REPO_NAME}/manifests/${REF_TAG}"
+                "http://${ZOT_REGISTRY}/v2/${REPO_NAME}/manifests/${REF_REF}"
           digest_of() { curl -fsS -I -u "${ZOT_USERNAME}:${ZOT_PASSWORD}" -H "${ACCEPT_H}" \
                 "http://${ZOT_REGISTRY}/v2/${REPO_NAME}/manifests/$1" \
                 | tr -d '\r' | sed -n 's/^Docker-Content-Digest:[[:space:]]*//Ip' | head -1; }
-          REF_DIGEST="$(digest_of "${REF_TAG}")"
-          SHA_DIGEST="$(digest_of "${SHA_TAG}")"
+          REF_DIGEST="$(digest_of "${REF_REF}")"
+          SHA_DIGEST="$(digest_of "${SHA_REF}")"
           if [ -z "${REF_DIGEST}" ] || [ "${REF_DIGEST}" != "${SHA_DIGEST}" ]; then
             echo "::error::retag verification failed: ref=${REF_DIGEST:-<none>} sha=${SHA_DIGEST:-<none>}"
             exit 1
