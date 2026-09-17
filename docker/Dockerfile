@@ -42,6 +42,14 @@ ARG MOONCAKE_VERSION=0.3.13.post1
 # torch_deps at this point, so --no-index can't strand them. Requires a
 # cp312-labeled wheel on the page — the image runs Python 3.12.
 ARG MOONCAKE_FIND_LINKS=
+# Mirror the pyproject torch pin so the heavy preinstall layer in torch_deps
+# stays cache-key independent of python/pyproject.toml content — small pyproject
+# bumps (transformers/xgrammar/...) no longer rebuild the ~3-4GB torch + cu13
+# nvidia-wheels layer. Bump TORCH_VERSION + TORCHAUDIO_VERSION here AND in
+# python/pyproject.toml together when torch versions roll. Naming mirrors
+# sgl-deep-ep.Dockerfile:12.
+ARG TORCH_VERSION=2.13.0
+ARG TORCHAUDIO_VERSION=2.11.0
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -236,6 +244,8 @@ ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
 ARG PYTORCH_INDEX
+ARG TORCH_VERSION
+ARG TORCHAUDIO_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -245,6 +255,25 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --profile minimal \
     && rustc --version && cargo --version
+
+# Heavy torch + nvidia-cu13 preinstall (CU13 only). Placed BEFORE the COPY of
+# python/pyproject.toml so routine pyproject dep churn doesn't bust this ~3-4GB
+# layer; only TORCH_*/TORCHAUDIO_* ARGs (or an upstream-layer change) do. Mirror
+# the exact index set the downstream `.[all]` RUN uses (default pip index via
+# pip.conf = the configured PyPI mirror, PLUS ${PYTORCH_INDEX}/cu${CUINDEX} as
+# an extra index for the cu13 nvidia wheels) so the resolver lands on the same
+# torch + cu13 nvidia-*-cu13 wheels; with deps enabled, the transitive
+# nvidia-*-cu13 wheels come along for free, and the subsequent `.all` step
+# finds torch+cu13 nvidia already installed and skips reinstalling them.
+# Skipped (exit 0) for CU12 builds — the existing cu13->cu12 swap dance later
+# in the .[all] RUN governs them.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    case "$CUDA_VERSION" in \
+        13.0.3) CUINDEX=130 ;; \
+        *) echo "heavy preinstall skipped for CUDA=$CUDA_VERSION"; exit 0 ;; \
+    esac \
+    && python3 -m pip install --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} \
+        "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" "torchvision"
 
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
