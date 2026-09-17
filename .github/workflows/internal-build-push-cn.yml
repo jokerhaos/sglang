@@ -328,7 +328,7 @@ jobs:
           # Blobs are already in ZOT (same digest), so this is a manifest-only
           # operation that takes seconds — replacing what used to be a second
           # full buildkit image export (~10min) for the 2nd tag.
-          REPO_NAME="${SHA_TAG%%:*}"   # e.g. sglang/sglang-cu13
+          REPO_NAME="${ZOT_REPOSITORY}/${SHA_TAG%%:*}"   # e.g. sglang/sglang-cu13 (namespace/repository)
           ACCEPT_H="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
           CT="$(curl -fsS -u "${ZOT_USERNAME}:${ZOT_PASSWORD}" -o /tmp/ref-manifest.json -D - \
                 -H "${ACCEPT_H}" \
