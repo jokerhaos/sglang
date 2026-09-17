@@ -531,3 +531,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# cache-hit smoke test: routine source-only change, should not bust the
+# heavy torch/nvidia/sgl-kernel preinstall layers (2026-09-17, ci cache test)
