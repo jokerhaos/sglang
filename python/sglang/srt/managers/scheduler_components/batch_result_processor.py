@@ -917,6 +917,10 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+        # A locally idle DP rank still runs empty batches while its peers decode.
+        # Refresh its gauges here too; it may never reach scheduler idle handling.
+        self.metrics_reporter._maybe_log_idle_metrics()
+
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,
