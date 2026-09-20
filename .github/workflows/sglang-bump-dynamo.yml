@@ -34,10 +34,9 @@ name: Bump dynamo sglang image
 #
 # NOTE: the workflow_run trigger only fires once BOTH this workflow AND
 # internal-build-push-cn.yml are on the DEFAULT branch (main) — workflow_run
-# always uses the default-branch copy of this file. Until then, a push build
-# of the cu13 branch auto-dispatches this workflow via the branch-test bridge
-# in internal-build-push-cn.yml (image_tag pre-filled with the built sha);
-# workflow_dispatch below stays available for ad-hoc tags.
+# always uses the default-branch copy of this file (both ship in the same PR,
+# so the chain is live right after merge). workflow_dispatch stays available
+# for ad-hoc tag bumps.
 
 on:
   workflow_run:
