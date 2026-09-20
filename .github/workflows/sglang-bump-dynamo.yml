@@ -20,6 +20,11 @@ name: Bump dynamo sglang image
 # a write PAT. Set repo secret:
 #   DYNAMO_BOT_TOKEN  (fine-grained PAT: contents:write + pull-requests:write on
 #   astro-web3/dynamo; classic `repo` scope also works) in astro-web3/sglang.
+#   Watch the expiry — an expired/dead token fails the dynamo clone with
+#   "Invalid username or token" at the first fetch.
+# dynamo is cloned through the gh-proxy; after the first run a persistent
+# shallow mirror under /cache/repos/astro-web3/dynamo means subsequent runs
+# only fetch the main delta (same pattern as internal-build-push-cn.yml).
 #
 # NOTE: the workflow_run trigger only fires once BOTH this workflow AND
 # internal-build-push-cn.yml are on the DEFAULT branch (main) — workflow_run
@@ -57,7 +62,9 @@ jobs:
   bump-dynamo:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: 0xtoken-arc-runner-set
-    timeout-minutes: 15
+    # 20 (not 15) min: warm runs finish in ~1-2 min, but the one-time dynamo
+    # mirror seed (full ~150MB shallow clone via gh-proxy) needs headroom.
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -134,9 +141,34 @@ jobs:
           url="https://x-access-token:${PAT}@github.com/${DYNAMO_REPO}.git"
           retry(){ local n; for n in $(seq 1 12); do "$@" && return 0; echo "::warning::attempt $n; sleep $((n*4))"; sleep $((n*4)); done; return 1; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-          retry git clone --no-tags --depth 1 --branch main "$url" "$GITHUB_WORKSPACE"
+          # Persistent shallow mirror under /cache/repos (same pattern as
+          # internal-build-push-cn.yml): the one-time full clone is the only
+          # expensive github trip; every later run fetches just the main delta
+          # and the work tree is cloned locally from the mirror. Pushes below
+          # use the explicit proxied origin URL, never the mirror path.
+          MIRROR="/cache/repos/${DYNAMO_REPO}"
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            mkdir -p "$(dirname "$MIRROR")"
+            if [ ! -d "$MIRROR/.git" ]; then
+              echo "::notice::(re)seeding dynamo mirror — one-time shallow clone via gh-proxy"
+              rm -rf "$MIRROR"
+              retry git clone --no-tags --depth 1 --branch main "$url" "$MIRROR"
+            fi
+            retry git -C "$MIRROR" remote set-url origin "$url"
+            retry git -C "$MIRROR" fetch --no-tags --depth 1 origin main
+            git -C "$MIRROR" checkout -f FETCH_HEAD
+            git -C "$MIRROR" clean -fdxq
+            # --no-local: the mirror is a shallow clone, hardlink/local clone
+            # off it is refused/degraded; transport clone of ~150MB is quick.
+            git clone --no-tags --no-local "$MIRROR" "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
+          else
+            echo "no /cache/repos volume — direct shallow clone via gh-proxy"
+            retry git clone --no-tags --depth 1 --branch main "$url" "$GITHUB_WORKSPACE"
+          fi
           # (Re)create the fixed branch off main.
           git checkout -B "${DYNAMO_BRANCH}"
+          git --no-pager log --oneline -1
 
       - name: Patch sglang.cuda13.0 runtime image in context.yaml
         if: steps.verify.outputs.ok == 'true'
