@@ -3,8 +3,10 @@ name: Bump dynamo sglang image
 # After a successful CU13 sglang build+push (internal-build-push-cn.yml, on
 # main), open/update a PR on astro-web3/dynamo that re-points the
 # sglang.cuda13.0 runtime image in container/context.yaml at the just-pushed
-# ZOT image, pinned to the build's 12-char SHA. base_image / base_image_tag are
-# left alone (dynamo's own build base).
+# ZOT image, pinned to the build's 12-char SHA. The ref written to dynamo uses
+# the registry's EXTERNAL domain (ZOT_PUBLIC_REGISTRY, default orc.0xtoken.cn)
+# — same ZOT as the in-cluster ZOT_REGISTRY — so it resolves from wherever
+# dynamo builds/pulls. base_image / base_image_tag are left alone.
 #
 # Fixed dynamo branch update-sglang-cu13-image = dynamo/main + this one commit;
 # the branch is reset to main each build, so a single, kept-open PR rolls
@@ -57,6 +59,11 @@ concurrency:
 
 env:
   ZOT_REGISTRY: ${{ vars.ZOT_REGISTRY != '' && vars.ZOT_REGISTRY || 'zot.orc-registry.svc.cluster.local:5000' }}
+  # The registry's EXTERNAL domain — what dynamo's context.yaml gets pinned
+  # to (its build/pull infra lives outside the cluster network, so the
+  # svc.cluster.local address wouldn't resolve there). Same ZOT registry
+  # behind both fronts.
+  ZOT_PUBLIC_REGISTRY: ${{ vars.ZOT_PUBLIC_REGISTRY != '' && vars.ZOT_PUBLIC_REGISTRY || 'orc.0xtoken.cn' }}
   ZOT_REPOSITORY: ${{ vars.ZOT_REPOSITORY != '' && vars.ZOT_REPOSITORY || 'sglang' }}
   GH_PROXY_HOST: ${{ vars.GH_PROXY_HOST != '' && vars.GH_PROXY_HOST || 'gh-proxy.com' }}
   DYNAMO_REPO: astro-web3/dynamo
@@ -80,7 +87,9 @@ jobs:
         shell: bash
         run: |
           set -ueo pipefail
-          IMAGE="${ZOT_REGISTRY}/${ZOT_REPOSITORY}/sglang-cu13"
+          # The dynamo-facing ref uses the EXTERNAL registry domain; existence
+          # is still checked against the in-cluster ZOT_REGISTRY below.
+          IMAGE="${ZOT_PUBLIC_REGISTRY}/${ZOT_REPOSITORY}/sglang-cu13"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.image_tag }}"
           else
