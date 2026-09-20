@@ -22,9 +22,13 @@ name: Bump dynamo sglang image
 #   astro-web3/dynamo; classic `repo` scope also works) in astro-web3/sglang.
 #   Watch the expiry — an expired/dead token fails the dynamo clone with
 #   "Invalid username or token" at the first fetch.
-# dynamo is cloned through the gh-proxy; after the first run a persistent
-# shallow mirror under /cache/repos/astro-web3/dynamo means subsequent runs
-# only fetch the main delta (same pattern as internal-build-push-cn.yml).
+# dynamo is cloned through the gh-proxy from a persistent blobless+sparse
+# partial mirror under /cache/repos/bump-dynamo/ (own namespace —
+# /cache/repos/<owner>/<repo> paths belong to the cluster's other tooling).
+# Only the container/ cone is ever materialized, so the seed is ~24MB and
+# every later run is a seconds-long metadata delta fetch. Without the /cache
+# volume it falls back to a full ~150MB clone (slow through gh-proxy, and
+# why timeout-minutes is generous).
 #
 # NOTE: the workflow_run trigger only fires once BOTH this workflow AND
 # internal-build-push-cn.yml are on the DEFAULT branch (main) — workflow_run
@@ -62,11 +66,11 @@ jobs:
   bump-dynamo:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: 0xtoken-arc-runner-set
-    # 45 min: warm runs finish in ~1-2 min, but the one-time dynamo mirror
-    # seed (full ~150MB shallow clone via gh-proxy, measured >15min at
-    # ~170KB/s) needs a wide margin. GitHub kills over-timeout jobs as
-    # "cancelled" — a bump run dying like that means the seed is still slow,
-    # not that it hung.
+    # 45 min: mirror runs finish in ~1-2 min (seed ~24MB blobless, quick),
+    # but the no-/cache fallback does a full ~150MB clone through gh-proxy
+    # (measured >15min at ~170KB/s). GitHub kills over-timeout jobs with
+    # conclusion "cancelled" — a bumped run dying that way is a timeout,
+    # not a hang.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -126,7 +130,7 @@ jobs:
           echo "::error::build reported success but tag ${TAG} is in neither sglang-cu13 (HTTP ${RT}) nor sglang-cu13-framework_final (HTTP ${FW}) in ZOT."
           exit 1
 
-      - name: Checkout dynamo (cross-repo via gh-proxy, PAT)
+      - name: Checkout dynamo (blobless sparse mirror, gh-proxy, PAT)
         if: steps.verify.outputs.ok == 'true'
         shell: bash
         env:
@@ -143,35 +147,41 @@ jobs:
             "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${PAT}" | base64 -w0)"
           url="https://x-access-token:${PAT}@github.com/${DYNAMO_REPO}.git"
           retry(){ local n; for n in $(seq 1 12); do "$@" && return 0; echo "::warning::attempt $n; sleep $((n*4))"; sleep $((n*4)); done; return 1; }
-          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-          # Persistent shallow mirror under /cache/repos (same pattern as
-          # internal-build-push-cn.yml): the one-time full clone is the only
-          # expensive github trip; every later run fetches just the main delta
-          # and the work tree is cloned locally from the mirror. Pushes below
-          # use the explicit proxied origin URL, never the mirror path.
-          MIRROR="/cache/repos/${DYNAMO_REPO}"
+          # Only container/context.yaml is ever patched. That keeps the
+          # persistent mirror cheap: a --filter=blob:none --sparse partial
+          # clone (~24MB of history trees; blobs materialize on demand, for
+          # the container/ cone only) instead of a full ~150MB dynamo
+          # checkout, which measured >15min through gh-proxy.
+          # The mirror deliberately lives under /cache/repos/bump-dynamo/, NOT
+          # /cache/repos/<owner>/<repo>: those paths hold mirrors owned by the
+          # cluster's other tooling — a foreign partial-clone of dynamo already
+          # sits at /cache/repos/astro-web3/dynamo, and cloning a workspace
+          # out of it dies with "could not fetch ... from promisor remote"
+          # (upload-pack refuses lazy fetches).
+          MIRROR="/cache/repos/bump-dynamo/${DYNAMO_REPO}"
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
             mkdir -p "$(dirname "$MIRROR")"
             if [ ! -d "$MIRROR/.git" ]; then
-              echo "::notice::(re)seeding dynamo mirror — one-time shallow clone via gh-proxy"
+              echo "::notice::seeding dynamo mirror — blobless sparse partial clone"
               rm -rf "$MIRROR"
-              retry git clone --no-tags --depth 1 --branch main "$url" "$MIRROR"
+              retry git clone --no-tags --depth 1 --branch main --filter=blob:none --sparse "$url" "$MIRROR"
+              git -C "$MIRROR" sparse-checkout set container
             fi
             retry git -C "$MIRROR" remote set-url origin "$url"
             retry git -C "$MIRROR" fetch --no-tags --depth 1 origin main
             git -C "$MIRROR" checkout -f FETCH_HEAD
             git -C "$MIRROR" clean -fdxq
-            # --no-local: the mirror is a shallow clone, hardlink/local clone
-            # off it is refused/degraded; transport clone of ~150MB is quick.
-            git clone --no-tags --no-local "$MIRROR" "$GITHUB_WORKSPACE"
-            git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
+            WORK="$MIRROR"
           else
-            echo "no /cache/repos volume — direct shallow clone via gh-proxy"
+            echo "no /cache/repos volume — direct full shallow clone via gh-proxy"
+            find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
             retry git clone --no-tags --depth 1 --branch main "$url" "$GITHUB_WORKSPACE"
+            WORK="$GITHUB_WORKSPACE"
           fi
+          echo "WORK=${WORK}" >> "$GITHUB_ENV"
           # (Re)create the fixed branch off main.
-          git checkout -B "${DYNAMO_BRANCH}"
-          git --no-pager log --oneline -1
+          git -C "$WORK" checkout -B "${DYNAMO_BRANCH}"
+          git -C "$WORK" --no-pager log --oneline -1
 
       - name: Patch sglang.cuda13.0 runtime image in context.yaml
         if: steps.verify.outputs.ok == 'true'
@@ -181,7 +191,7 @@ jobs:
           TAG: ${{ steps.ref.outputs.tag }}
         run: |
           set -ueo pipefail
-          F="container/context.yaml"
+          F="${WORK}/container/context.yaml"
           python3 - "$F" "$IMAGE" "$TAG" <<'PY'
           import re, sys
           path, image, tag = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -201,7 +211,7 @@ jobs:
           open(path, 'w').write(s[:m.start(2)] + blk + s[m.end(2):])
           PY
           echo "--- diff (sglang.cuda13.0) ---"
-          git --no-pager diff -- container/context.yaml | sed -n '1,30p'
+          git -C "$WORK" --no-pager diff -- container/context.yaml | sed -n '1,30p'
 
       - name: Commit + push (skip if unchanged)
         if: steps.verify.outputs.ok == 'true'
@@ -211,16 +221,16 @@ jobs:
           PAT: ${{ secrets.DYNAMO_BOT_TOKEN }}
         run: |
           set -ueo pipefail
-          git config user.name  "sglang-ci[bot]"
-          git config user.email "sglang-ci[bot]@users.noreply.github.com"
-          if git diff --quiet -- container/context.yaml; then
+          git -C "$WORK" config user.name  "sglang-ci[bot]"
+          git -C "$WORK" config user.email "sglang-ci[bot]@users.noreply.github.com"
+          if git -C "$WORK" diff --quiet -- container/context.yaml; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "::notice::context.yaml already at this image; nothing to push."
             exit 0
           fi
-          git add container/context.yaml
-          git commit -q -m "ci(sglang): bump runtime image to ${{ steps.ref.outputs.full }}"
-          git push --force "https://x-access-token:${PAT}@github.com/${DYNAMO_REPO}.git" \
+          git -C "$WORK" add container/context.yaml
+          git -C "$WORK" commit -q -m "ci(sglang): bump runtime image to ${{ steps.ref.outputs.full }}"
+          git -C "$WORK" push --force "https://x-access-token:${PAT}@github.com/${DYNAMO_REPO}.git" \
             "${DYNAMO_BRANCH}:${DYNAMO_BRANCH}"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
