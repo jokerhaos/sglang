@@ -11,6 +11,11 @@ name: Bump dynamo sglang image
 # forward to the latest built image. If the image ref is unchanged the commit/push
 # is skipped (no no-op churn).
 #
+# The resolved tag is verified in ZOT (manifest HEAD, basic auth) before
+# patching: a dispatch build of only framework_final at that SHA skips with a
+# notice — dynamo pins the runtime variant, which such a build doesn't push;
+# a tag missing entirely is a hard error (successful run but no image = bug).
+#
 # Cross-repo: runs in astro-web3/sglang but writes astro-web3/dynamo, so it needs
 # a write PAT. Set repo secret:
 #   DYNAMO_BOT_TOKEN  (fine-grained PAT: contents:write + pull-requests:write on
@@ -31,6 +36,12 @@ on:
         description: 'sglang-cu13 image tag to pin in dynamo context.yaml (e.g. a 12-char sha)'
         required: true
         type: string
+
+# Serialize runs: every run recreates the same dynamo branch off main and
+# force-pushes it — two back-to-back bumps must not interleave.
+concurrency:
+  group: dynamo-sglang-bump
+  cancel-in-progress: false
 
 env:
   ZOT_REGISTRY: ${{ vars.ZOT_REGISTRY != '' && vars.ZOT_REGISTRY || 'zot.orc-registry.svc.cluster.local:5000' }}
@@ -64,7 +75,46 @@ jobs:
           echo "tag=${TAG}"            >> "$GITHUB_OUTPUT"
           echo "full=${IMAGE}:${TAG}"  >> "$GITHUB_OUTPUT"
 
+      - name: Verify image tag exists in ZOT
+        id: verify
+        shell: bash
+        env:
+          ZOT_USERNAME: ${{ secrets.ZOT_USERNAME }}
+          ZOT_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+          TAG: ${{ steps.ref.outputs.tag }}
+        run: |
+          set -ueo pipefail
+          if [ -z "${ZOT_USERNAME}" ] || [ -z "${ZOT_PASSWORD}" ]; then
+            echo "::error::ZOT_USERNAME / ZOT_PASSWORD secrets are not set (repo Settings → Secrets and Variables → Actions)."
+            exit 1
+          fi
+          ACCEPT_H="Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
+          code() { # $1: image name under the ZOT namespace, $2: tag → HTTP status
+            curl -sS -o /dev/null -w '%{http_code}' -I \
+              -u "${ZOT_USERNAME}:${ZOT_PASSWORD}" -H "${ACCEPT_H}" \
+              "http://${ZOT_REGISTRY}/v2/${ZOT_REPOSITORY}/$1/manifests/$2"
+          }
+          RT="$(code sglang-cu13 "${TAG}")"
+          if [ "${RT}" = "200" ]; then
+            DIGEST="$(curl -fsSI -u "${ZOT_USERNAME}:${ZOT_PASSWORD}" -H "${ACCEPT_H}" \
+              "http://${ZOT_REGISTRY}/v2/${ZOT_REPOSITORY}/sglang-cu13/manifests/${TAG}" \
+              | tr -d '\r' | sed -n 's/^Docker-Content-Digest:[[:space:]]*//Ip' | head -1)"
+            echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+            echo "ok=true"          >> "$GITHUB_OUTPUT"
+            echo "verified ${ZOT_REPOSITORY}/sglang-cu13:${TAG} in ZOT${DIGEST:+ (${DIGEST})}"
+            exit 0
+          fi
+          FW="$(code sglang-cu13-framework_final "${TAG}")"
+          if [ "${FW}" = "200" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::only the framework_final variant was built at this SHA — dynamo pins the runtime image, nothing to bump."
+            exit 0
+          fi
+          echo "::error::build reported success but tag ${TAG} is in neither sglang-cu13 (HTTP ${RT}) nor sglang-cu13-framework_final (HTTP ${FW}) in ZOT."
+          exit 1
+
       - name: Checkout dynamo (cross-repo via gh-proxy, PAT)
+        if: steps.verify.outputs.ok == 'true'
         shell: bash
         env:
           PAT: ${{ secrets.DYNAMO_BOT_TOKEN }}
@@ -86,6 +136,7 @@ jobs:
           git checkout -B "${DYNAMO_BRANCH}"
 
       - name: Patch sglang.cuda13.0 runtime image in context.yaml
+        if: steps.verify.outputs.ok == 'true'
         shell: bash
         env:
           IMAGE: ${{ steps.ref.outputs.image }}
@@ -115,6 +166,7 @@ jobs:
           git --no-pager diff -- container/context.yaml | sed -n '1,30p'
 
       - name: Commit + push (skip if unchanged)
+        if: steps.verify.outputs.ok == 'true'
         id: push
         shell: bash
         env:
@@ -135,11 +187,12 @@ jobs:
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Open or reuse the PR (API direct — api.github.com is reachable)
-        if: steps.push.outputs.changed == 'true'
+        if: steps.verify.outputs.ok == 'true' && steps.push.outputs.changed == 'true'
         shell: bash
         env:
           PAT: ${{ secrets.DYNAMO_BOT_TOKEN }}
           FULL: ${{ steps.ref.outputs.full }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
         run: |
           set -ueo pipefail
           # If an open PR already tracks this branch, the force-push already
@@ -151,6 +204,7 @@ jobs:
             | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['number'] if d else '')" 2>/dev/null || true)
           if [ -n "${existing}" ]; then
             echo "::notice::open PR #${existing} on ${DYNAMO_REPO} already tracks ${DYNAMO_BRANCH}; updated by the push."
+            echo "PR_URL=https://github.com/${DYNAMO_REPO}/pull/${existing}" >> "$GITHUB_ENV"
             exit 0
           fi
           body="$(cat <<EOF
@@ -158,14 +212,22 @@ jobs:
 
           - \`sglang.cuda13.0.runtime_image\`     → \`${FULL%:*}\`
           - \`sglang.cuda13.0.runtime_image_tag\` → \`${FULL##*:}\`
+          - \`digest\` → \`${DIGEST:-not recorded}\`
 
           \`base_image\` / \`base_image_tag\` left unchanged (dynamo's own build base).
           The branch \`${DYNAMO_BRANCH}\` is reset to main + this single commit each build, so this PR tracks the latest built image.
           EOF
           )"
-          python3 -c "import json,sys; print(json.dumps({'title':'ci(sglang): bump sglang runtime image to ${FULL}','head':'${DYNAMO_BRANCH}','base':'main','body':sys.argv[1]}))" "$body" \
-            | curl -fsSL -X POST "${hdr[@]}" "${api}/pulls" -d @- \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); print('PR #' + str(d.get('number')) + ': ' + d.get('html_url',''))"
+          RESP="$(python3 -c "import json,sys; print(json.dumps({'title':'ci(sglang): bump sglang runtime image to ${FULL}','head':'${DYNAMO_BRANCH}','base':'main','body':sys.argv[1]}))" "$body" \
+            | curl -fsSL -X POST "${hdr[@]}" "${api}/pulls" -d @-)"
+          PR_URL="$(python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('html_url',''))" <<<"${RESP}")"
+          PR_NUM="$(python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('number',''))"  <<<"${RESP}")"
+          if [ -z "${PR_URL}" ]; then
+            echo "::error::PR create returned no URL: ${RESP}"
+            exit 1
+          fi
+          echo "PR #${PR_NUM}: ${PR_URL}"
+          echo "PR_URL=${PR_URL}" >> "$GITHUB_ENV"
 
       - name: Summary
         if: always()
@@ -175,6 +237,15 @@ jobs:
             echo "### Bump dynamo sglang image"
             echo ""
             echo "- image: \`${{ steps.ref.outputs.full }}\`"
+            if [ -n "${{ steps.verify.outputs.digest }}" ]; then
+              echo "- digest: \`${{ steps.verify.outputs.digest }}\`"
+            fi
+            if [ -n "${PR_URL:-}" ]; then
+              echo "- PR: ${PR_URL}"
+            fi
+            if [ "${{ steps.verify.outputs.ok }}" = "false" ]; then
+              echo "- result: skipped (no runtime image at this SHA — likely a framework_final-only build)"
+            fi
             echo "- dynamo branch: \`${DYNAMO_BRANCH}\` (off current main)"
             echo "- pushed: \`${{ steps.push.outputs.changed }}\`"
             echo "- repo: https://github.com/${DYNAMO_REPO}"
