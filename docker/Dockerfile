@@ -1,20 +1,63 @@
 ARG CUDA_VERSION=13.0.3
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
+# CI overrides this to a pre-mirrored registry (e.g. orc.0xtoken.cn/nvidia/cuda)
+# so the build doesn't depend on docker.io; defaults to nvidia/cuda so the
+# Dockerfile stays buildable anywhere. Used by the `base` and `runtime` stages.
+ARG CUDA_BASE_IMAGE=nvidia/cuda
+FROM ${CUDA_BASE_IMAGE}:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG SGL_KERNEL_VERSION=0.4.7
+ARG SGL_KERNEL_VERSION=0.4.6.post1
 ARG SGL_VERSION
+ARG SGL_DEEP_GEMM_VERSION=0.1.7
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG SGL_NCCL_VERSION=2.30.7
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
+# PyTorch wheel index (https://download.pytorch.org/whl/<cuXXX>); CI overrides
+# to a domestic mirror. Default keeps the Dockerfile buildable anywhere.
+ARG PYTORCH_INDEX=https://download.pytorch.org/whl
+# rustup dist/update servers; CI overrides to a domestic rsproxy mirror so the
+# Rust toolchain download doesn't stall on static.rust-lang.org (often blocked).
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+# Cargo registry mirror base (empty = crates.io upstream, portable; CI -> rsproxy
+# so Rust builds don't stall on blocked/slow crates.io). The config.toml written
+# from it is inherited by every stage that runs cargo (gateway_builder's
+# sgl-model-gateway, framework's sglang-grpc extension).
+ARG CARGO_REGISTRY_MIRROR=
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.18
-ARG MOONCAKE_VERSION=0.3.13
+# Keep in sync with what the MOONCAKE_FIND_LINKS page hosts: ==0.3.13 does NOT
+# match a 0.3.13.post1 wheel (PEP 440 post-release is a distinct version).
+ARG MOONCAKE_VERSION=0.3.13.post1
+# Find-links page serving the mooncake-transfer-engine-cuda13 wheels (internal
+# MinIO). Empty = install straight from the pip index (portable default). When
+# set, the CU13 install resolves from this page ONLY (--no-index --find-links)
+# so the wheel never silently falls back to the pip mirror; mooncake's runtime
+# deps (aiohttp/requests/msgpack) are sglang core deps, already installed by
+# torch_deps at this point, so --no-index can't strand them. Requires a
+# cp312-labeled wheel on the page — the image runs Python 3.12.
+ARG MOONCAKE_FIND_LINKS=
+# Mirror the pyproject torch pin so the heavy preinstall layer in torch_deps
+# stays cache-key independent of python/pyproject.toml content — small pyproject
+# bumps (transformers/xgrammar/...) no longer rebuild the ~3-4GB torch + cu13
+# nvidia-wheels layer. Bump TORCH_VERSION + TORCHAUDIO_VERSION here AND in
+# python/pyproject.toml together when torch versions roll. Naming mirrors
+# sgl-deep-ep.Dockerfile:12.
+ARG TORCH_VERSION=2.13.0
+ARG TORCHAUDIO_VERSION=2.11.0
+# Find-links page serving the CU13 heavy wheels (torch + torchvision + torchaudio
+# + triton + sgl-kernel + the nvidia-*-cu13 family, hosted on the internal
+# MinIO). Empty = plain pip index install (portable default). When set, the
+# heavy preinstall and sgl-kernel layers pull their wheels from this page
+# (several MB/s over LAN instead of the ~0.5 MB/s public-mirror throttle);
+# the configured index remains available as a fallback for anything missing,
+# so the page doesn't have to be exhaustive.
+ARG HEAVY_FIND_LINKS=
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -25,6 +68,44 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+# Abort git clones that stall — the gh-proxy git-upload-pack path can stall
+# silently and hang the whole build (>1KB/s floor for 60s, 20s connect).
+# Also rewrite EVERY https://github.com/ git URL through the gh-proxy so any
+# git clone inside any stage (devtools' oh-my-zsh, framework's mscclpp
+# FetchContent, framework_final's sglang clone, ...) reaches github via the
+# domestic proxy the runner CAN reach, instead of stalling on github.com.
+# Default GITHUB_ARTIFACTORY=github.com makes this a harmless self-rewrite;
+# CI sets it to gh-proxy.com/https://github.com. Set via env (not `git config`)
+# so it applies before git is installed in any stage and needs no extra layers.
+# Inherited by every stage that runs git.
+ENV GIT_CONFIG_COUNT=4 \
+    GIT_CONFIG_KEY_0=http.lowSpeedLimit \
+    GIT_CONFIG_VALUE_0=1000 \
+    GIT_CONFIG_KEY_1=http.lowSpeedTime \
+    GIT_CONFIG_VALUE_1=60 \
+    GIT_CONFIG_KEY_2=http.connectTimeout \
+    GIT_CONFIG_VALUE_2=20 \
+    GIT_CONFIG_KEY_3=url.https://${GITHUB_ARTIFACTORY}/.insteadOf \
+    GIT_CONFIG_VALUE_3=https://github.com/
+
+# Route rustup through RUSTUP_DIST_SERVER/RUSTUP_UPDATE_ROOT (default upstream;
+# CI sets rsproxy) so the toolchain download doesn't hit blocked hosts.
+# Inherited by torch_deps + gateway_builder (both install Rust).
+ARG RUSTUP_DIST_SERVER
+ARG RUSTUP_UPDATE_ROOT
+ENV RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
+
+# Cargo registry mirror — written before rustup installs into /root/.cargo so
+# it survives the install, inherited by all cargo-using stages. Default empty
+# = crates.io (portable); CI sets rsproxy.cn.
+ARG CARGO_REGISTRY_MIRROR
+RUN if [ -n "${CARGO_REGISTRY_MIRROR:-}" ]; then \
+      mkdir -p /root/.cargo && \
+      printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+%s/index/"\n[net]\ngit-fetch-with-cli = true\n' \
+        "${CARGO_REGISTRY_MIRROR}" > /root/.cargo/config.toml; \
+    fi
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
@@ -126,7 +207,7 @@ fi
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
-    && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
+    && curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
         https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
@@ -170,25 +251,66 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
+ARG PYTORCH_INDEX
+ARG TORCH_VERSION
+ARG TORCHAUDIO_VERSION
+ARG HEAVY_FIND_LINKS
 
 WORKDIR /sgl-workspace
 
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --profile minimal \
     && rustc --version && cargo --version
+
+# Heavy torch + nvidia-cu13 preinstall (CU13 only). Placed BEFORE the COPY of
+# python/pyproject.toml so routine pyproject dep churn doesn't bust this ~3-4GB
+# layer; only TORCH_*/TORCHAUDIO_* ARGs (or an upstream-layer change) do. Mirror
+# the exact index set the downstream `.[all]` RUN uses (default pip index via
+# pip.conf = the configured PyPI mirror, PLUS ${PYTORCH_INDEX}/cu${CUINDEX} as
+# an extra index for the cu13 nvidia wheels) so the resolver lands on the same
+# torch + cu13 nvidia-*-cu13 wheels; with deps enabled, the transitive
+# nvidia-*-cu13 wheels come along for free, and the subsequent `.all` step
+# finds torch+cu13 nvidia already installed and skips reinstalling them.
+# Skipped (exit 0) for CU12 builds — the existing cu13->cu12 swap dance later
+# in the .[all] RUN governs them.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    case "$CUDA_VERSION" in \
+        13.0.3) CUINDEX=130 ;; \
+        *) echo "heavy preinstall skipped for CUDA=$CUDA_VERSION"; exit 0 ;; \
+    esac \
+    && FL= && \
+    if [ -n "${HEAVY_FIND_LINKS}" ]; then FL="--find-links ${HEAVY_FIND_LINKS}"; fi && \
+    python3 -m pip install ${FL} --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} \
+        "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" "torchvision"
 
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    && FL= && \
+    if [ -n "${HEAVY_FIND_LINKS}" ]; then FL="--find-links ${HEAVY_FIND_LINKS}"; fi \
     && case "$CUDA_VERSION" in \
-        13.0.3) ;; \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    # --no-deps prevents pip from pulling torch from default PyPI
-    && python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps
+    && if [ "$CUDA_VERSION" = "12.6.3" ]; then \
+        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+    ; \
+    elif [ "$CUDA_VERSION" = "12.9.2" ]; then \
+        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+    ; \
+    elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
+        # --no-deps prevents pip from pulling torch from default PyPI
+        python3 -m pip install ${FL} sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
+    ; \
+    else \
+        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+    ; \
+    fi
 
 # Copy dep spec + Rust crate source + proto files. setuptools-rust compiles the
 # Rust extension during the stub wheel build; the crate's build.rs references
@@ -199,11 +321,16 @@ COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
 COPY proto                 /tmp/sglang_deps/proto
 
-# Install sglang dependencies (torch, transformers, etc.).
+# Install sglang dependencies (torch, transformers, etc.). CUDA 12 DeepEP
+# wheels live only on the SGLang index, so preinstall the local-version wheel;
+# it satisfies the public-version pyproject pin during the full dependency solve.
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     case "$CUDA_VERSION" in \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
@@ -213,7 +340,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && SGL_DEEP_EP_VERSION="$(sed -n 's/^[[:space:]]*"sgl-deep-ep==\([^"]*\)",/\1/p' pyproject.toml)" \
+    && test -n "${SGL_DEEP_EP_VERSION}" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           python3 -m pip install \
+               "sgl-deep-ep==${SGL_DEEP_EP_VERSION}+cu129" \
+               --index-url "https://docs.sglang.ai/whl/cu129/" \
+               --no-deps; \
+       fi \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
+       fi \
+    && python3 -m pip install --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
+               | xargs -r python3 -m pip uninstall -y && \
+           python3 -m pip install --index-url ${PYTORCH_INDEX}/cu${CUINDEX} \
+               torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --force-reinstall; \
+           python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
+       fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
@@ -249,6 +396,7 @@ FROM torch_deps AS hpc_ops_builder
 # RoPE kernels from the Tencent Hunyuan AI Infra team, consumed by the opt-in
 # hpc_ops attention and MoE runner backends.
 ARG HPC_OPS_COMMIT=ab1a402724635507037426068f6cddc3d30dc0a8
+ARG GITHUB_ARTIFACTORY
 
 WORKDIR /build
 
@@ -258,7 +406,7 @@ WORKDIR /build
 RUN --mount=type=cache,target=/root/.cache/pip \
     mkdir -p /wheels && \
     if [ "$(uname -m)" = "x86_64" ]; then \
-        git clone https://github.com/Tencent/hpc-ops.git && \
+        n=0; until git clone https://${GITHUB_ARTIFACTORY}/Tencent/hpc-ops.git; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "hpc-ops clone attempt $n failed (gh-proxy anon git-upload-pack 403 transient), retry in $((n*4))s"; rm -rf hpc-ops; sleep $((n*4)); done && \
         cd hpc-ops && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
@@ -272,16 +420,30 @@ FROM torch_deps AS flashinfer_cache
 ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
+ARG GITHUB_ARTIFACTORY=github.com
 
 # Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
-    # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
-    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+    # flashinfer-cubin (0.6.18+) lives ONLY on flashinfer.ai/whl — the domestic
+    # runner can't reach flashinfer.ai (connection-timeout). That PEP503 index
+    # just redirects to GitHub release assets, which the runner CAN reach via
+    # the gh-proxy (CI sets GITHUB_ARTIFACTORY=gh-proxy.com/https://github.com;
+    # default github.com keeps the Dockerfile buildable anywhere). Fetch the
+    # 1.5GB wheel with retries to a local file then `pip install` it so deps
+    # still resolve from the default (aliyun) index. buildkit caches this layer
+    # once it succeeds, so the big download is one-time.
+    && curl --retry 6 --retry-delay 3 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fL \
+        -o "/tmp/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
+        "https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
+    && python3 -m pip install "/tmp/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
+    && rm -f "/tmp/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
     && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin /flashinfer_jit_output/ \
     && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
@@ -306,15 +468,15 @@ RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # Download CLI tools (each in its own layer for parallel downloads)
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/diff-so-fancy \
+RUN curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -LSso /tools/diff-so-fancy \
         https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
     && chmod +x /tools/diff-so-fancy
 
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/clang-format \
+RUN curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -LSso /tools/clang-format \
         https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /tools/clang-format
 
-RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
+RUN curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL -o /tmp/clangd.zip \
         https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
     && unzip -q /tmp/clangd.zip -d /tmp \
     && cp /tmp/clangd_18.1.3/bin/* /tools/ \
@@ -324,21 +486,41 @@ RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && curl --retry 3 --retry-delay 2 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
+    && curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
         "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "/tmp/${CMAKE_INSTALLER}.tar.gz" -C /tmp \
     && cp -r "/tmp/${CMAKE_INSTALLER}/bin/"* /tools/ \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+# just: fetch the release tarball DIRECTLY via gh-proxy — just.systems (the
+# install.sh host) is unreachable from the CI cluster (SSL connection timeout),
+# has no domestic mirror, and --speed-time doesn't fire on a stuck SSL handshake
+# (no data flows), so the curl idled for hours. The just release tarball on
+# github.com carries the same binary that install.sh would download; pull it
+# through gh-proxy and extract just into /tools. --max-time backstop catches any
+# hung connect.
+RUN mkdir -p /tools && \
+    curl --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 --max-time 300 -fsSL \
+        "https://${GITHUB_ARTIFACTORY}/casey/just/releases/download/1.42.4/just-1.42.4-$(uname -m)-unknown-linux-musl.tar.gz" \
+        | tar -xzf - -C /tools just
 
-# Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+# Install oh-my-zsh + plugins by cloning the repos directly through the
+# gh-proxy. We deliberately do NOT run ohmyzsh/tools/install.sh: it fetches the
+# core repo via a hardcoded `git fetch https://github.com/ohmyzsh/ohmyzsh.git`
+# (REMOTE defaults to that exact URL), which the domestic runner cannot reach
+# — the clone stalls until http.lowSpeedLimit aborts it ("Operation too slow.
+# Less than 1000 bytes/sec transferred the last 60 seconds", run 34221793092),
+# and being inside install.sh it can't be wrapped in a retry. install.sh's
+# other work (write a .zshrc template, chsh) is irrelevant here: the final
+# stage COPYs its own .zshrc, and `source $ZSH/oh-my-zsh.sh` only needs the repo
+# files. Cloning into /root/.oh-my-zsh reproduces install.sh's layout exactly;
+# plugins go to custom/plugins (matching docker/configs/.zshrc). Each clone is
+# wrapped in the same gh-proxy retry loop as mscclpp/hpc-ops (gh-proxy anon
+# git-upload-pack intermittently 403s, per-IP rate limit).
+RUN { n=0; until git clone --depth=1 https://${GITHUB_ARTIFACTORY}/ohmyzsh/ohmyzsh.git /root/.oh-my-zsh; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "oh-my-zsh clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf /root/.oh-my-zsh; sleep $((n*4)); done; } \
+    && { n=0; until git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "zsh-autosuggestions clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"; sleep $((n*4)); done; } \
+    && { n=0; until git clone --depth 1 https://${GITHUB_ARTIFACTORY}/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting; do n=$((n+1)); [ $n -ge 8 ] && exit 1; echo "zsh-syntax-highlighting clone attempt $n (gh-proxy 403 transient), retry in $((n*4))s"; rm -rf "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"; sleep $((n*4)); done; }
 
 ########################################################
 # PARALLEL STAGE 5: Gateway Builder (starts from base)
@@ -359,7 +541,9 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 60 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -367,7 +551,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
     && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+    # /root/.cargo/{registry,git} are cache mounts (excluded from the layer) —
+    # keep them. Only remove the rustup toolchain + its bin/ symlinks so the
+    # exported stage layer stays small. `rm -rf /root/.cargo` would wipe the
+    # cache mounts and force a full crate re-download next build.
+    && rm -rf /root/.rustup /root/.cargo/bin /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
 
 ########################################################
 ########## Final Framework Image ######################
@@ -384,6 +572,7 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
+ARG MOONCAKE_FIND_LINKS
 ARG MSCCLPP_VERSION
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
@@ -460,14 +649,31 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 # Python packages and tools (before source copy for better caching)
 # =============================================================================
 
-# Install Mooncake
+# Install Mooncake (CU13 wheels come from the internal find-links page only —
+# see MOONCAKE_FIND_LINKS above; the cuda12 fallback stays on the pip index)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}
+    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+    FL= && \
+    if [ -n "${MOONCAKE_FIND_LINKS}" ]; then FL="--no-index --find-links ${MOONCAKE_FIND_LINKS}"; fi && \
+    if [ "$CUDA_MAJOR" -ge 13 ]; then \
+        python3 -m pip install ${FL} mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
+    else \
+        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+    fi
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    n=0; until git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp; do \
+        n=$((n+1)); [ $n -ge 8 ] && exit 1; \
+        echo "mscclpp clone attempt $n failed (gh-proxy anon git-upload-pack 403 is transient), retrying in $((n*4))s"; \
+        rm -rf /tmp/mscclpp; sleep $((n*4)); \
+    done \
+    && git config --global url."https://${GITHUB_ARTIFACTORY}/".insteadOf "https://github.com/" \
     && case "${CUDA_VERSION}" in \
+           12.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda12]"; \
+               ;; \
            13.*) \
                CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
                python3 -m pip install "/tmp/mscclpp[cuda13]"; \
@@ -503,15 +709,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # resolving dependencies and generating constraints.txt. DeepEP needs 2.30.7
 # at runtime; apply the override only after the constrained dependency solve.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall --no-deps \
-        "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 -m pip install --force-reinstall --no-deps \
+            "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"; \
+    fi
 
-# The `nixl` stub package is needed (it owns the `nixl` import path) but
-# unconditionally requires nixl-cu12, so install it with --no-deps and pair it
-# with the nixl-cu13 binary to avoid shipping wrong-CUDA libs.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install nixl nixl-cu13 --no-deps \
-    && python3 -m pip install "cuda-python>=13,<14"
+# Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
+# the `nixl` import path) but unconditionally requires nixl-cu12, so we install
+# it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
+# to avoid shipping wrong-CUDA libs on cu13 images.
+RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+    python3 -m pip install nixl nixl-cu12 --no-deps ; \
+    python3 -m pip install "cuda-python>=12,<13" ; \
+elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+    python3 -m pip install nixl nixl-cu13 --no-deps ; \
+    python3 -m pip install "cuda-python>=13,<14" ; \
+fi
 
 # Install the latest available AI Dynamo prerelease from NVIDIA's package index.
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -562,6 +775,12 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG GITHUB_ARTIFACTORY
+# HuggingFace Hub endpoint. huggingface_hub defaults to huggingface.co, which
+# the domestic runner can't reach (kernels lock/download -> ConnectError
+# 'Network is unreachable'); CI sets this to hf-mirror.com. Empty = use the
+# huggingface.co default (portable).
+ARG HF_ENDPOINT
 
 WORKDIR /sgl-workspace
 
@@ -569,18 +788,26 @@ COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 https://${GITHUB_ARTIFACTORY}/sgl-project/sglang.git /sgl-workspace/sglang; \
     elif [ -z "$SGL_VERSION" ]; then \
         echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
     else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 --branch v${SGL_VERSION} https://${GITHUB_ARTIFACTORY}/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
 
 # Editable install (fast - dependencies already installed via constraints)
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     cd /sgl-workspace/sglang \
+    && if [ -n "${HF_ENDPOINT:-}" ]; then export HF_ENDPOINT; fi \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
+       fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; \
@@ -597,8 +824,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
              # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
-             # combo, fall back to runtime JIT instead of failing the build, \
-             # mirroring the aarch64 branch. \
+             # combo (e.g. cu129 publishes no torch>=2.10 cubin), fall back to \
+             # runtime JIT instead of failing the build, mirroring the aarch64 branch. \
              if [ "$success" != "1" ]; then \
                  echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
                  success=1; \
@@ -655,7 +882,7 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 # - Ready-to-run inference server environment
 #
 # Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
+FROM ${CUDA_BASE_IMAGE}:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
@@ -682,7 +909,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     ca-certificates \
     netcat-openbsd \
     curl \
-    ffmpeg \
     git \
     # Runtime libraries
     libopenmpi3 \
