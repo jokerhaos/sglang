@@ -49,6 +49,11 @@ on:
   push:
     branches:
       - main
+      # TODO(test): temporary — branch pushes exercise the build → bump-dynamo
+      # chain here (workflow_run chaining only works from default-branch
+      # copies). Drop together with the dispatch step below when this branch
+      # merges to astro/main.
+      - ci/internal-build-cu13-zot
     paths:
       - 'docker/**'
       - 'python/**'
@@ -118,6 +123,9 @@ jobs:
     timeout-minutes: 240
     permissions:
       contents: read
+      # For the branch-test dispatch of sglang-bump-dynamo (workflow_dispatch
+      # API) — see the dispatch step at the end of this job.
+      actions: write
     steps:
       - name: Checkout
         shell: bash
@@ -352,6 +360,29 @@ jobs:
           fi
           echo "Re-tagged ${SHA_TAG} -> ${REF_TAG} (${REF_DIGEST}, digest match verified)"
 
+      # Branch-test bridge: on astro/main, sglang-bump-dynamo.yml chains off
+      # this workflow via workflow_run — but that only reads default-branch
+      # copies, which don't exist yet. Off-main, a push build on this branch
+      # dispatches the branch's copy of the same workflow with the sha tag this
+      # run just pushed — the exact workflow_dispatch test path its header
+      # documents. Drop this step and the branch entry above at main merge time.
+      - name: Dispatch sglang-bump-dynamo (branch-test bridge)
+        if: github.event_name == 'push' && github.ref_name != 'main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA_TAG: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -ueo pipefail
+          payload="$(python3 -c "import json,sys; print(json.dumps({'ref': sys.argv[1], 'inputs': {'image_tag': sys.argv[2]}}))" "${GITHUB_REF_NAME}" "${SHA_TAG}")"
+          curl -fsSL -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sglang-bump-dynamo.yml/dispatches" \
+            -d "${payload}"
+          echo "BUMP_TAG=${SHA_TAG}" >> "$GITHUB_ENV"
+          echo "dispatched sglang-bump-dynamo.yml @ ${GITHUB_REF_NAME} (image_tag=${SHA_TAG})"
+
       - name: Summary
         if: always()
         shell: bash
@@ -370,6 +401,7 @@ jobs:
             echo "| sha (\`${SHA}\`) | \`${PRIMARY}\` |"
             echo "| floating (branch/tag) | \`${FLOATING}\` |"
             [ -n "${DIGEST}" ] && echo "| digest | \`${DIGEST}\` |"
+            [ -n "${BUMP_TAG:-}" ] && echo "| bump-dynamo | dispatched (image_tag \`${BUMP_TAG}\`) |"
             echo ""
             echo "Registry: \`${{ env.ZOT_REGISTRY }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
