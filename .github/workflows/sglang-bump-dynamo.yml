@@ -62,9 +62,12 @@ jobs:
   bump-dynamo:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: 0xtoken-arc-runner-set
-    # 20 (not 15) min: warm runs finish in ~1-2 min, but the one-time dynamo
-    # mirror seed (full ~150MB shallow clone via gh-proxy) needs headroom.
-    timeout-minutes: 20
+    # 45 min: warm runs finish in ~1-2 min, but the one-time dynamo mirror
+    # seed (full ~150MB shallow clone via gh-proxy, measured >15min at
+    # ~170KB/s) needs a wide margin. GitHub kills over-timeout jobs as
+    # "cancelled" — a bump run dying like that means the seed is still slow,
+    # not that it hung.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
