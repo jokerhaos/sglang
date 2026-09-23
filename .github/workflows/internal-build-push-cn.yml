@@ -69,6 +69,14 @@ on:
         required: false
         type: boolean
         default: false
+      cache_mode:
+        description: 'BuildKit cache export mode (max = all intermediate stages, use after Dockerfile restructuring; min = target chain only, faster)'
+        required: false
+        type: choice
+        default: max
+        options:
+          - max
+          - min
 
 # Avoid duplicate concurrent builds of the same variant on the same ref — let
 # the in-flight one finish (tags are SHA-keyed; a cancelled push can leave a
@@ -111,6 +119,15 @@ env:
   # (ZOT rejecting BuildKit's OCI cache manifest), flip this to false in repo
   # Settings → Variables (no code change). Also auto-disabled under no_cache.
   USE_REGISTRY_CACHE: ${{ vars.USE_REGISTRY_CACHE != '' && vars.USE_REGISTRY_CACHE || 'true' }}
+  # BuildKit cache EXPORT mode for routine push builds: min = target chain only
+  # (~10 min faster — the mode=max export re-uploads every changed intermediate
+  # layer to ZOT after each build). Records already in the ZOT cache ref
+  # persist, so unchanged stages (gateway rust build, devtools, ...) still
+  # import from the last max export; only new intermediate records stop being
+  # written. workflow_dispatch carries its own cache_mode input (default max):
+  # after restructuring docker/Dockerfile, run a dispatch build to refresh the
+  # full intermediate-stage records.
+  CACHE_EXPORT_MODE: ${{ vars.CACHE_EXPORT_MODE != '' && vars.CACHE_EXPORT_MODE || 'min' }}
 
 jobs:
   build-push:
@@ -310,10 +327,16 @@ jobs:
             --output "type=image,name=${SHA_IMG},push=true,registry.insecure=true"
           )
           [ "${NO_CACHE}" = "true" ] && ARGS+=(--opt "no-cache=true")
+          # Cache export mode: dispatch input wins (default max on manual runs —
+          # use those to refresh intermediate-stage records after Dockerfile
+          # changes); routine push builds fall back to CACHE_EXPORT_MODE (min —
+          # target chain only, ~10 min cheaper per build).
+          CACHE_MODE="${{ inputs.cache_mode }}"
+          [ -n "${CACHE_MODE}" ] || CACHE_MODE="${CACHE_EXPORT_MODE}"
           if [ "${USE_REGISTRY_CACHE}" = "true" ] && [ "${NO_CACHE}" != "true" ]; then
             ARGS+=(
               --import-cache "type=registry,ref=${CACHE_REF},registry.insecure=true"
-              --export-cache "type=registry,ref=${CACHE_REF},mode=max,registry.insecure=true"
+              --export-cache "type=registry,ref=${CACHE_REF},mode=${CACHE_MODE},registry.insecure=true"
             )
           fi
           # Stream progress live to the Actions log; keep a copy for digest grep.

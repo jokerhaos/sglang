@@ -250,6 +250,13 @@ FROM base AS torch_deps
 ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
+# CU13 sgl-kernel flavor must track the plain (PyPI) sglang-kernel pin in
+# python/pyproject.toml -- if the preinstall below installs any other version,
+# the `.[all]` resolve re-downloads the ~373MB wheel from the public mirror
+# (that is what v0.4.6.post1 here did against pyproject's ==0.4.7). The CU12
+# flavors (+cu124/+cu129 GitHub release wheels) stop at 0.4.6.post1 upstream
+# (v0.4.7 ships only cu130/rocm/musa assets), hence the split ARG.
+ARG SGL_KERNEL_CU13_VERSION=0.4.7
 ARG GITHUB_ARTIFACTORY
 ARG PYTORCH_INDEX
 ARG TORCH_VERSION
@@ -304,8 +311,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
-        # --no-deps prevents pip from pulling torch from default PyPI
-        python3 -m pip install ${FL} sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
+        # --no-deps prevents pip from pulling torch from default PyPI. The plain
+        # 0.4.7 wheel (same flavor the `.[all]` resolve wants) comes from the
+        # internal MinIO heavy page at LAN speed; index stays as fallback.
+        python3 -m pip install ${FL} sglang-kernel==${SGL_KERNEL_CU13_VERSION} --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
@@ -353,7 +362,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
-    && python3 -m pip install --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && FL= && \
+    if [ -n "${HEAVY_FIND_LINKS}" ]; then FL="--find-links ${HEAVY_FIND_LINKS}"; fi && \
+    # Pass the internal heavy-wheels page to the full solve too: it serves
+    # sgl_kernel (must match the sglang-kernel pin or pip re-downloads the
+    # ~373MB wheel) plus the big py-side wheels (transformers/tokenizers/...)
+    # at LAN speed; the configured index remains the fallback for anything
+    # missing, so the page doesn't have to be exhaustive.
+    python3 -m pip install ${FL} --extra-index-url ${PYTORCH_INDEX}/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
