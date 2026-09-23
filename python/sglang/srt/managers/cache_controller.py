@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.observability.hicache_trace import StorageTrace
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -238,6 +239,7 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        self.storage_trace = StorageTrace()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -517,6 +519,24 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+        # Workers have stopped, so abandoned queue entries can no longer emit IO.
+        for name in (
+            "prefetch_queue",
+            "prefetch_buffer",
+            "prefetch_hit_queue",
+            "backup_queue",
+        ):
+            queue = getattr(self, name, None)
+            if queue is None:
+                continue
+            with queue.mutex:
+                pending = tuple(queue.queue)
+            for operation in pending:
+                if operation is not None:
+                    operation.storage_trace.finish(
+                        "cancelled", operation.completed_tokens
+                    )
 
     def attach_storage_backend(
         self,
@@ -994,12 +1014,16 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        trace_carrier: Optional[dict[str, str]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
             request_id, new_input_tokens, last_hash, prefix_keys
+        )
+        operation.storage_trace = StorageTrace(
+            trace_carrier, requested_tokens=len(new_input_tokens)
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1159,7 +1183,12 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                with operation.storage_trace.stage(
+                    "read", self.storage_backend
+                ) as span:
+                    completed_pages = self._page_transfer(operation)
+                    if span is not None:
+                        span.set_attribute("hicache.completed_pages", completed_pages)
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1228,7 +1257,14 @@ class HiCacheController:
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    with operation.storage_trace.stage(
+                        "query", self.storage_backend
+                    ) as span:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                        if span is not None:
+                            span.set_attribute("hicache.hit_tokens", storage_hit_count)
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1262,6 +1298,9 @@ class HiCacheController:
         """
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+        )
+        operation.storage_trace = StorageTrace(
+            shared=True, requested_tokens=len(token_ids)
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1313,7 +1352,19 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    with operation.storage_trace.stage("write", self.storage_backend):
+                        self._page_backup(operation)
+                operation.storage_trace.finish(
+                    "skipped"
+                    if self.backup_skip
+                    else (
+                        "complete"
+                        if operation.completed_tokens
+                        == len(operation.hash_value) * self.page_size
+                        else "error"
+                    ),
+                    operation.completed_tokens,
+                )
                 self.ack_backup_queue.put(operation)
 
             except Empty:

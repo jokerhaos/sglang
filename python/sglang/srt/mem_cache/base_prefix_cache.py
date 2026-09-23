@@ -45,6 +45,9 @@ if TYPE_CHECKING:
 class CacheRequestHandle:
     rid: str
     attempt_id: int
+    trace_carrier: Optional[dict[str, str]] = dataclasses.field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
 
 class CacheRequestOutcome(Enum):

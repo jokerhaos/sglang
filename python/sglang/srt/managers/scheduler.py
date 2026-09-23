@@ -3116,6 +3116,12 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+                from sglang.srt.observability.hicache_trace import request_carrier
+
+                req.cache_request_handle = dataclasses.replace(
+                    req.cache_request_handle,
+                    trace_carrier=request_carrier(req.time_stats.trace_ctx),
+                )
                 tree_cache.prefetch_from_storage(
                     req.cache_request_handle,
                     last_host_node,

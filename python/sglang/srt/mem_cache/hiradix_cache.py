@@ -518,6 +518,9 @@ class HiRadixCache(RadixCache):
             for req_id, info in list(self.ongoing_prefetch.items()):
                 try:
                     last_host_node, prefetch_key, _operation = info
+                    _operation.storage_trace.finish(
+                        "cancelled", _operation.completed_tokens
+                    )
                 except Exception:
                     # Unexpected shape; just drop it.
                     self.ongoing_prefetch.pop(req_id, None)
@@ -621,7 +624,12 @@ class HiRadixCache(RadixCache):
                     continue
                 if operation.storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
-                    self._revoke_pending_prefetch(req_id)
+                    self._revoke_pending_prefetch(
+                        req_id,
+                        "miss"
+                        if operation.storage_hit_count == 0
+                        else "below_threshold",
+                    )
                     logger.debug(
                         f"Revoking prefetch for request {req_id} due to insufficient hits ({operation.storage_hit_count})."
                     )
@@ -642,7 +650,7 @@ class HiRadixCache(RadixCache):
                     if alloc_len >= self.prefetch_threshold:
                         host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
-                    self._revoke_pending_prefetch(req_id)
+                    self._revoke_pending_prefetch(req_id, "allocation_failed")
                     logger.debug(
                         f"Revoking prefetch for request {req_id} due to host memory allocation failure."
                     )
@@ -1621,11 +1629,12 @@ class HiRadixCache(RadixCache):
             # unknown prefetch stop policy, just return True
             return True
 
-    def _revoke_pending_prefetch(self, req_id: str):
+    def _revoke_pending_prefetch(self, req_id: str, outcome: str = "fallback"):
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is None:
             return
-        last_host_node, prefetch_key, _ = info
+        last_host_node, prefetch_key, operation = info
+        operation.storage_trace.finish(outcome, operation.completed_tokens)
         last_host_node.release_host()
         cc = self.cache_controller
         cc.prefetch_tokens_occupied = max(
@@ -1660,6 +1669,18 @@ class HiRadixCache(RadixCache):
             return False
 
         # Terminate in-flight prefetch.
+        completed_tokens = self._clamp_prefetch_result(operation)
+        if (
+            completed_tokens < operation.storage_hit_count
+            or operation.host_indices is None
+        ):
+            operation.storage_trace.finish(
+                "timeout"
+                if self.prefetch_stop_policy == "timeout"
+                and self.is_prefetch_timeout(operation)
+                else "early_stop",
+                completed_tokens,
+            )
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             # Stopping before host memory was committed (best_effort, timeout, or
@@ -1675,6 +1696,12 @@ class HiRadixCache(RadixCache):
         # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
         # and `pool_hits` in their operations are same.  No need to sync cross-rank here.
         min_completed_tokens = self._clamp_prefetch_result(operation)
+        operation.storage_trace.finish(
+            "complete"
+            if min_completed_tokens == operation.storage_hit_count
+            else "partial",
+            min_completed_tokens,
+        )
         logger.debug(
             f"Prefetch {req_id} completed with {operation.completed_tokens} tokens"
         )
@@ -1815,6 +1842,7 @@ class HiRadixCache(RadixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            trace_carrier=handle.trace_carrier,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
@@ -2020,6 +2048,7 @@ class HiRadixCache(RadixCache):
             return
 
         last_host_node, prefetch_key, operation = self.ongoing_prefetch[rid]
+        operation.storage_trace.finish("cancelled", operation.completed_tokens)
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(rid)

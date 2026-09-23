@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.observability.hicache_trace import StorageTrace
 
 logger = logging.getLogger(__name__)
 
@@ -562,6 +563,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        trace_carrier: Optional[dict[str, str]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -570,6 +572,10 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
+        )
+        operation.storage_trace = StorageTrace(
+            trace_carrier or handle.trace_carrier,
+            requested_tokens=len(new_input_tokens),
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -588,6 +594,9 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+        )
+        operation.storage_trace = StorageTrace(
+            shared=True, requested_tokens=len(token_ids)
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -654,12 +663,13 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
-    def _page_transfer(self, operation: PrefetchOperation) -> bool:
+    def _page_transfer(self, operation: PrefetchOperation) -> int:
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 
         # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
         self._page_transfer_sidecar(operation, kv_completed_pages)
+        return kv_completed_pages
 
     def _page_transfer_sidecar(
         self, operation: PrefetchOperation, kv_completed_pages: int
@@ -792,7 +802,15 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                with operation.storage_trace.stage("write", self.storage_backend):
+                    self._page_backup(operation)
+                operation.storage_trace.finish(
+                    "complete"
+                    if operation.completed_tokens
+                    == len(operation.hash_value) * self.page_size
+                    else "error",
+                    operation.completed_tokens,
+                )
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
