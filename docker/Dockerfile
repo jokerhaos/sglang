@@ -833,9 +833,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
              echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
              success=1; \
          else \
+             # 5-min hard cap per attempt: an hf-mirror outage stalls the SSL
+             # handshake with zero data flow (pip/git low-speed aborts do not
+             # apply to the kernels tool). On 2026-09-23 this hung kernels
+             # download until the 4h job timeout instead of falling back to
+             # runtime JIT. timeout(124) follows the same failure path as a
+             # normal failed attempt, so the worst case is ~17 min of retries
+             # before the JIT fallback below.
              for i in 1 2 3; do \
                  echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-                 kernels download python && \
+                 timeout 300 kernels download python && \
                  success=1 && break; \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
