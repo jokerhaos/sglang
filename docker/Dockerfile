@@ -925,6 +925,11 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     ca-certificates \
     netcat-openbsd \
     curl \
+    # torchcodec (SGLang's primary video-input decode backend) dlopens the
+    # system libav* libs at import time. Official v0.5.20 ships ffmpeg here
+    # (its runtime apt list); dropping it left torchcodec installed but not
+    # importable in the runtime image.
+    ffmpeg \
     git \
     # Runtime libraries
     libopenmpi3 \
@@ -1015,6 +1020,13 @@ COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
+
+# Fail the build if torchcodec is installed but cannot load (it dlopens the
+# system ffmpeg from the apt list above). This is exactly how the runtime
+# ffmpeg trim shipped silently: pip installing the wheel succeeds, only the
+# import touches libav*. Arms-only builds skip (pyproject's torchcodec marker
+# excludes aarch64, where find_spec returns None).
+RUN python3 -c "import importlib.util as u; assert u.find_spec('torchcodec') is None or __import__('torchcodec')"
 
 WORKDIR /sgl-workspace/sglang
 
