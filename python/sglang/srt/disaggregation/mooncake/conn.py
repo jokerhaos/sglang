@@ -56,10 +56,15 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.observability import trace as tracing
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
     mooncake_trace_slice,
+)
+from sglang.srt.observability.native_trace import (
+    capture_trace_context,
+    native_trace_scope,
 )
 from sglang.srt.observability.trace import (
     TraceNullContext,
@@ -638,14 +643,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def _transfer_data(self, mooncake_session_id, transfer_blocks, trace_carrier=None):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-        )
+        if trace_carrier is None:
+            trace_carrier = capture_trace_context()
+        with native_trace_scope(self.engine, trace_carrier):
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
 
     def _send_kvcache_generic(
         self,
@@ -774,10 +782,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.append((src_addr, dst_addr, length))
             return transfer_blocks
 
+        # Capture before submission: OTel context is not inherited by threads.
+        trace_carrier = capture_trace_context()
+
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(
+                mooncake_session_id, transfer_blocks, trace_carrier
+            )
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
@@ -1082,12 +1095,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for src_group, dst_group in zip(src_groups, dst_groups)
             ]
 
+        trace_carrier = capture_trace_context()
+
         def process_layer(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> int:
             return self._transfer_data(
                 mooncake_session_id,
                 set_transfer_blocks(src_ptr, dst_ptr, token_item_len, groups),
+                trace_carrier,
             )
 
         if self.enable_custom_mem_pool:
@@ -1220,6 +1236,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
         )
 
+        trace_carrier = capture_trace_context()
+
         def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
             dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
@@ -1233,9 +1251,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
-            )
+            with native_trace_scope(self.engine, trace_carrier):
+                return self.engine.batch_transfer_sync(
+                    mooncake_session_id, src_addr_list, dst_addr_list, length_list
+                )
 
         futures = [
             executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
@@ -1851,13 +1870,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            trace_token = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                parent_context = None
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                    )
+
+                    # These slices are explicit spans, not ambient spans.
+                    thread_context = (
+                        kv_chunk.trace_ctx.thread_context
+                        if kv_chunk.trace_ctx.tracing_enable
+                        else None
+                    )
+                    stack = thread_context.cur_slice_stack if thread_context else []
+                    if thread_context:
+                        parent_context = tracing.trace.set_span_in_context(
+                            stack[-1].span if stack else thread_context.thread_span,
+                            tracing.context.Context(),
+                        )
+                if tracing.opentelemetry_initialized:
+                    trace_token = tracing.context.attach(
+                        parent_context
+                        if parent_context is not None
+                        else tracing.context.Context()
                     )
 
                 # Counted at dequeue, before the status check, so
@@ -2175,6 +2215,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if trace_token is not None:
+                    tracing.context.detach(trace_token)
 
     def start_prefill_thread(self):
         def bootstrap_thread():

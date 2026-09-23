@@ -1,18 +1,13 @@
 """Explicit, queue-safe tracing for HiCache storage operations."""
 
-import logging
 import threading
 from contextlib import contextmanager
-from functools import lru_cache
 
 from sglang.srt.observability import trace as tracing
-
-logger = logging.getLogger(__name__)
-
-
-@lru_cache(maxsize=1)
-def _warn_native_context_failure():
-    logger.warning("HiCache native trace context failed; continuing cache IO")
+from sglang.srt.observability.native_trace import (
+    capture_trace_context,
+    native_trace_scope,
+)
 
 
 def request_carrier(trace_ctx):
@@ -83,38 +78,9 @@ class StorageTrace:
             "hicache." + name, context=self.context
         ) as span:
             store = getattr(backend, "store", None)
-            setter = getattr(store, "set_trace_context", None)
-            previous = None
             try:
-                if setter is not None:
-                    carrier = {}
-                    tracing.TraceContextTextMapPropagator().inject(carrier)
-                    try:
-                        previous = setter(
-                            carrier.get("traceparent", ""),
-                            carrier.get("tracestate", ""),
-                        )
-                    except Exception:
-                        _warn_native_context_failure()
-                        clear = getattr(store, "clear_trace_context", None)
-                        if clear is not None:
-                            try:
-                                clear()
-                            except Exception:
-                                pass
-                yield span
+                with native_trace_scope(store, capture_trace_context()):
+                    yield span
             except Exception:
                 self.finish("error")
                 raise
-            finally:
-                if previous is not None:
-                    try:
-                        setter(*previous)
-                    except Exception:
-                        _warn_native_context_failure()
-                        clear = getattr(store, "clear_trace_context", None)
-                        if clear is not None:
-                            try:
-                                clear()
-                            except Exception:
-                                pass
