@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -352,7 +352,7 @@ class PrefillBootstrapQueue:
 
         dest_tp_ranks = [self.tp_rank]
 
-        req.disagg_kv_sender = kv_sender_class(
+        _sender_kwargs = dict(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
@@ -360,6 +360,22 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        # Link Mooncake transfer spans to the parent request's W3C trace.
+        if getattr(kv_sender_class, "supports_external_trace_header", False):
+            trace_ctx = getattr(req.time_stats, "trace_ctx", None)
+            if getattr(trace_ctx, "tracing_enable", False):
+                root = getattr(trace_ctx, "root_span_context", None)
+                if root is not None:
+                    carrier: Dict[str, str] = {}
+                    from opentelemetry.trace.propagation.tracecontext import (
+                        TraceContextTextMapPropagator,
+                    )
+
+                    # TraceReqContext extracts W3C regardless of the application's
+                    # global propagator (which may instead emit B3, for example).
+                    TraceContextTextMapPropagator().inject(carrier, root)
+                    _sender_kwargs["external_trace_header"] = carrier
+        req.disagg_kv_sender = kv_sender_class(**_sender_kwargs)
         self._process_req(req)
         req.pending_bootstrap = True
         return True
