@@ -11,8 +11,50 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import CommonKVReceiver, CommonKVSender
 from sglang.test.test_utils import CustomTestCase
+
+
+class TestKVFailureEventMetrics(CustomTestCase):
+    def test_timeout_events_preserve_terminal_behavior(self):
+        for cls, method, event, threshold in [
+            (CommonKVSender, "_check_bootstrap_timeout", "bootstrap_timeout", "bootstrap_timeout"),
+            (CommonKVReceiver, "_check_waiting_timeout", "transfer_timeout", "waiting_timeout"),
+        ]:
+            with self.subTest(event=event), patch(
+                "sglang.srt.disaggregation.common.conn.KV_FAILURE_EVENTS"
+            ) as events, patch(
+                "sglang.srt.disaggregation.common.conn.time.time", return_value=100
+            ):
+                receiver = SimpleNamespace(
+                    init_time=95, bootstrap_room=7, abort_notified=True,
+                    kv_mgr=SimpleNamespace(**{threshold: 10}, record_failure=Mock(), update_status=Mock()),
+                    invalidate_cached_bootstrap_infos=Mock(),
+                )
+                self.assertIsNone(getattr(cls, method)(receiver))
+                events.labels.assert_not_called()
+                receiver.init_time = 80
+                self.assertEqual(getattr(cls, method)(receiver), KVPoll.Failed)
+                events.labels.assert_called_once_with(event=event)
+                events.labels.return_value.inc.assert_called_once_with()
+                receiver.kv_mgr.update_status.assert_called_once_with(7, KVPoll.Failed)
+                getattr(cls, method)(receiver)
+                events.labels.return_value.inc.assert_called_once_with()
+
+    def test_abort_is_an_event_not_a_peer_metric_label(self):
+        for cls in (CommonKVSender, CommonKVReceiver):
+            with self.subTest(cls=cls), patch(
+                "sglang.srt.disaggregation.common.conn.KV_FAILURE_EVENTS"
+            ) as events:
+                receiver = SimpleNamespace(
+                    bootstrap_room=7, abort_notified=True,
+                    kv_mgr=SimpleNamespace(record_failure=Mock(), update_status=Mock()),
+                )
+                cls.abort(receiver)
+                events.labels.assert_called_once_with(event="abort")
+                self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+                cls.abort(receiver)
+                events.labels.return_value.inc.assert_called_once_with()
 
 
 class _ConcreteReceiver(CommonKVReceiver):

@@ -15,6 +15,7 @@ import requests
 import torch.distributed as dist
 import zmq
 from aiohttp import web
+from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
@@ -49,6 +50,21 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Event observations, not unique failed requests. No room/session/peer labels.
+# Zero-seed the bounded vocabulary so absence can be distinguished from no events.
+KV_FAILURE_EVENTS = Counter(
+    "sglang:kv_failure_events_total",
+    "KV control/transfer event observations; not a request failure denominator.",
+    ["event"],
+)
+for _event in (
+    "bootstrap_timeout", "transfer_timeout", "abort", "session_failed",
+    "session_recovered", "index_mismatch", "transfer_thread_failed",
+    "transfer_failed", "metadata_invalid",
+):
+    KV_FAILURE_EVENTS.labels(event=_event).inc(0)
+
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -460,6 +476,7 @@ class CommonKVManager(BaseKVManager):
                 return None
             msg = msg[1:]
         if len(msg) < 3:
+            KV_FAILURE_EVENTS.labels(event="metadata_invalid").inc()
             logger.warning(
                 "Dropping malformed prefill status message with %d frames", len(msg)
             )
@@ -469,6 +486,7 @@ class CommonKVManager(BaseKVManager):
             status = int(msg[1].decode("ascii"))
             prefill_rank = int(msg[2].decode("ascii"))
         except (UnicodeDecodeError, ValueError):
+            KV_FAILURE_EVENTS.labels(event="metadata_invalid").inc()
             logger.warning("Dropping unparsable prefill status message")
             return None
         failure_reason = (
@@ -533,8 +551,10 @@ class CommonKVManager(BaseKVManager):
                 failure_reason = (
                     failure_reason or "Room marked Failed before the transfer ended"
                 )
+        new_failure = False
         if status == KVPoll.Failed:
             with self.failure_lock:
+                new_failure = bootstrap_room not in self.failure_records
                 # Keep the first root cause; later callers see the symptom.
                 failure_reason = self.failure_records.setdefault(
                     bootstrap_room, failure_reason or "KV transfer failed"
@@ -542,6 +562,14 @@ class CommonKVManager(BaseKVManager):
 
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
+        if new_failure:
+            KV_FAILURE_EVENTS.labels(event="transfer_failed").inc()
+            # Peer addresses remain in logs for incident-time Pod IP correlation.
+            logger.warning(
+                "kv_transfer_failure room=%s source=%s:%s targets=%s reason=%s",
+                bootstrap_room, getattr(self, "local_ip", None),
+                getattr(self, "rank_port", None), targets, failure_reason,
+            )
         self.update_status(bootstrap_room, status)
         self.send_kv_status_message(
             targets=targets,
@@ -1551,6 +1579,9 @@ class CommonKVSender(BaseKVSender):
         elapsed = time.time() - self.init_time
         if elapsed < self.kv_mgr.bootstrap_timeout:
             return None
+        if not getattr(self, "_timeout_event_recorded", False):
+            KV_FAILURE_EVENTS.labels(event="bootstrap_timeout").inc()
+            self._timeout_event_recorded = True
         logger.warning_once(
             "Some requests timed out when bootstrapping, "
             "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
@@ -1576,6 +1607,9 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
+        if not getattr(self, "_abort_event_recorded", False):
+            KV_FAILURE_EVENTS.labels(event="abort").inc()
+            self._abort_event_recorded = True
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
@@ -1826,6 +1860,9 @@ class CommonKVReceiver(BaseKVReceiver):
         elapsed = time.time() - self.init_time
         if elapsed < self.kv_mgr.waiting_timeout:
             return None
+        if not getattr(self, "_timeout_event_recorded", False):
+            KV_FAILURE_EVENTS.labels(event="transfer_timeout").inc()
+            self._timeout_event_recorded = True
         logger.warning_once(
             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
@@ -1855,6 +1892,9 @@ class CommonKVReceiver(BaseKVReceiver):
         )
 
     def abort(self):
+        if not getattr(self, "_abort_event_recorded", False):
+            KV_FAILURE_EVENTS.labels(event="abort").inc()
+            self._abort_event_recorded = True
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",

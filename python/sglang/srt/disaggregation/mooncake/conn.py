@@ -17,6 +17,7 @@ from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    KV_FAILURE_EVENTS,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -1606,6 +1607,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # Paged SWA/DSA tolerate a 1-page drift -> keep the
                     # lenient truncation below.
                     if self._requires_exact_state_index_match(st):
+                        KV_FAILURE_EVENTS.labels(event="index_mismatch").inc()
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
@@ -2096,6 +2098,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
+                                    if req.mooncake_session_id not in self.failed_sessions:
+                                        KV_FAILURE_EVENTS.labels(event="session_failed").inc()
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
@@ -2122,6 +2126,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         self.session_failures[
                                             req.mooncake_session_id
                                         ] += 1
+                                        if req.mooncake_session_id not in self.failed_sessions:
+                                            KV_FAILURE_EVENTS.labels(event="session_failed").inc()
                                         self.failed_sessions.add(
                                             req.mooncake_session_id
                                         )
@@ -2211,6 +2217,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
+                KV_FAILURE_EVENTS.labels(event="transfer_thread_failed").inc()
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -2495,6 +2502,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         session_id,
                     )
                     FAILED_SESSION_RECOVERIES.inc()
+                    KV_FAILURE_EVENTS.labels(event="session_recovered").inc()
             else:
                 logger.debug("Probe still failing for %s (rc=%d)", session_id, rc)
 
