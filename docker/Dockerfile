@@ -34,6 +34,8 @@ ARG FLASHINFER_VERSION=0.6.18
 # Keep in sync with what the MOONCAKE_FIND_LINKS page hosts: ==0.3.13 does NOT
 # match a 0.3.13.post1 wheel (PEP 440 post-release is a distinct version).
 ARG MOONCAKE_VERSION=0.3.13.post1
+# Native tracing release from the internal wheel publisher (CU13 only).
+ARG MOONCAKE_CUDA13_VERSION=0.3.13.post2
 # Find-links page serving the mooncake-transfer-engine-cuda13 wheels (internal
 # MinIO). Empty = install straight from the pip index (portable default). When
 # set, the CU13 install resolves from this page ONLY (--no-index --find-links)
@@ -588,6 +590,7 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
+ARG MOONCAKE_CUDA13_VERSION
 ARG MOONCAKE_FIND_LINKS
 ARG MSCCLPP_VERSION
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
@@ -672,10 +675,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     FL= && \
     if [ -n "${MOONCAKE_FIND_LINKS}" ]; then FL="--no-index --find-links ${MOONCAKE_FIND_LINKS}"; fi && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        python3 -m pip install ${FL} mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
+        python3 -m pip install ${FL} mooncake-transfer-engine-cuda13==${MOONCAKE_CUDA13_VERSION}; \
     else \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
+
+# Fail before the remaining build if the wheel lacks the shared native
+# context implementation. No GPU or collector is contacted by this check.
+COPY docker/check_mooncake_native_tracing.py /tmp/check_mooncake_native_tracing.py
+RUN if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 /tmp/check_mooncake_native_tracing.py; \
+    fi && rm /tmp/check_mooncake_native_tracing.py
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -1034,6 +1044,12 @@ RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linu
 # import touches libav*. Arms-only builds skip (pyproject's torchcodec marker
 # excludes aarch64, where find_spec returns None).
 RUN python3 -c "import importlib.util as u; assert u.find_spec('torchcodec') is None or __import__('torchcodec')"
+
+# Verify again after copying into the slim runtime, where library paths differ.
+COPY docker/check_mooncake_native_tracing.py /tmp/check_mooncake_native_tracing.py
+RUN if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 /tmp/check_mooncake_native_tracing.py; \
+    fi && rm /tmp/check_mooncake_native_tracing.py
 
 WORKDIR /sgl-workspace/sglang
 
