@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
+from array import array
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -128,6 +130,101 @@ def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
+
+def reconcile_mm_request_length(req: Req, authoritative_len: int) -> bool:
+    """Realign this request's expanded multimodal token count to prefill's
+    authoritative total length.
+
+    Under encoder disaggregation the decode instance expands multimodal
+    placeholder tokens from its own local preprocessing, while prefill
+    materializes the encoder-side real count. The prefill role pushes that
+    authoritative count; here we make the decode-side layout match it by
+    trimming (or extending) the multimodal pad-token runs:
+
+      - trimming removes multimodal pad tokens scanning from the sequence
+        end, i.e. out of the last (usually video) run first;
+      - extending inserts pad tokens at the end of the last multimodal run.
+
+    Because every token of a modality run shares one id, both operations
+    yield exactly the sequence prefill expanded, provided the divergence is
+    confined to the multimodal region (which it is: both sides tokenize the
+    identical text). Returns False when the change cannot be made safely, in
+    which case callers keep their own count and the length checks upstream
+    will surface the mismatch.
+    """
+    mm = getattr(req, "multimodal_inputs", None)
+    if mm is None:
+        return False
+    # The expanded multimodal placeholders carry per-item pad values (the
+    # hash-derived pad token, often far outside the vocab) -- the literal
+    # im/audio/video token ids are the fall-back, not the primary.
+    mm_token_ids = {
+        item.pad_value
+        for item in getattr(mm, "mm_items", None) or []
+        if getattr(item, "pad_value", None) is not None
+    }
+    mm_token_ids.update(
+        tid
+        for tid in (mm.im_token_id, mm.audio_token_id, mm.video_token_id)
+        if tid is not None
+    )
+    if not mm_token_ids:
+        return False
+
+    origin = req.origin_input_ids
+    delta = authoritative_len - len(origin)
+    if delta == 0:
+        return True
+
+    if delta < 0:
+        to_remove = -delta
+        new_origin = array("q", origin)
+        removed = 0
+        for i in range(len(new_origin) - 1, -1, -1):
+            if removed == to_remove:
+                break
+            if new_origin[i] in mm_token_ids:
+                del new_origin[i]
+                removed += 1
+        if removed != to_remove:
+            logger.warning(
+                "PD mm length reconcile: rid=%s cannot trim %d mm tokens "
+                "(only %d present); keeping decode count",
+                req.rid,
+                to_remove,
+                removed,
+            )
+            return False
+    else:
+        last_mm_token = None
+        last_mm_pos = -1
+        for i in range(len(origin) - 1, -1, -1):
+            if origin[i] in mm_token_ids:
+                last_mm_pos = i
+                last_mm_token = origin[i]
+                break
+        if last_mm_pos < 0:
+            logger.warning(
+                "PD mm length reconcile: rid=%s has no mm tokens to extend by %d",
+                req.rid,
+                delta,
+            )
+            return False
+        new_origin = array("q")
+        new_origin.extend(origin[: last_mm_pos + 1])
+        new_origin.extend(array("q", [last_mm_token] * delta))
+        new_origin.extend(origin[last_mm_pos + 1 :])
+
+    old_origin = origin
+    old_len = len(old_origin)
+    req.origin_input_ids = new_origin
+    unpadded = getattr(req, "origin_input_ids_unpadded", None)
+    if unpadded is not None and len(unpadded) == old_len:
+        req.origin_input_ids_unpadded = array("q", new_origin)
+    # Keep the fill-id invariant: lengths now disagree by construction, so a
+    # full rebuild (not the in-place append in _refresh_fill_ids) is required.
+    req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+    return True
 
 class DecodeReqToTokenPool:
     """
@@ -393,6 +490,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        # PD multimodal length reconciliation (encoder disaggregation): the
+        # prefill role pushes the authoritative expanded input length per
+        # room ("INLEN") once the room bootstraps. Bridge it into this queue.
+        self._inlen_lock = threading.Lock()
+        self._room_to_req: Dict[int, "DecodeRequest"] = {}
         # In-flight authoritative room -> DP-rank lookups, consumed below.
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
@@ -415,6 +517,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        # PD mm length reconciliation: bridge prefill's pushed INLEN into
+        # this queue once the manager exists.
+        if hasattr(self.kv_manager, "room_inlen_pending"):
+            self.kv_manager.on_prefill_input_len = self._handle_prefill_input_len
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -1106,6 +1212,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
+        # Drop the mm-length-reconciliation registry entries of finished
+        # requests so the room map does not grow unboundedly.
+        for room in list(self._room_to_req.keys()):
+            if self._room_to_req[room].req.finished():
+                self._room_to_req.pop(room, None)
+
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
@@ -1228,6 +1340,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
+            # Consume a prefill-pushed authoritative input length (multimodal
+            # under encoder disaggregation) BEFORE building any length-derived
+            # state, so registration and the request layout agree with what
+            # prefill will actually materialize.
+            if (
+                decode_req.req.multimodal_inputs is not None
+                and not decode_req.is_rebootstrap
+            ):
+                inlen = self.kv_manager.room_inlen_pending.get(
+                    decode_req.req.bootstrap_room
+                )
+                if inlen is not None and len(decode_req.req.origin_input_ids) != inlen:
+                    if reconcile_mm_request_length(decode_req.req, inlen):
+                        logger.info(
+                            "PD mm length reconcile: rid=%s realigned decode "
+                            "expansion %d -> %d tokens before registration",
+                            decode_req.req.rid,
+                            len(decode_req.req.origin_input_ids),
+                            inlen,
+                        )
+
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
@@ -1582,6 +1715,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 **metadata_kwargs,
             )
+            # Track this room for the PD mm length reconciliation: a prefill
+            # "INLEN" push arriving between our length read and this send
+            # would otherwise be recorded but never consumed. Close that race
+            # here: if the authoritative length already arrived and disagrees,
+            # realign and re-register now.
+            room = decode_req.req.bootstrap_room
+            if room is not None:
+                self._room_to_req[room] = decode_req
+                if (
+                    decode_req.req.multimodal_inputs is not None
+                    and not decode_req.is_rebootstrap
+                ):
+                    inlen = self.kv_manager.room_inlen_pending.get(room)
+                    if (
+                        inlen is not None
+                        and len(decode_req.req.origin_input_ids) != inlen
+                        and reconcile_mm_request_length(decode_req.req, inlen)
+                    ):
+                        logger.info(
+                            "PD mm length reconcile: rid=%s realigned decode "
+                            "expansion -> %d tokens, re-registering (post-send race)",
+                            decode_req.req.rid,
+                            inlen,
+                        )
+                        self._resend_kv_metadata_after_inlen(decode_req)
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
@@ -1605,6 +1763,144 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _handle_prefill_input_len(self, room: int, length: int) -> None:
+        """Listener-thread entry: prefill pushed the authoritative expanded
+        input length for a room (encoder-disaggregation mm requests). If the
+        request already registered its transfer destinations, realign and
+        re-register; otherwise pop_preallocated() consumes the pending value.
+        """
+        decode_req = self._room_to_req.get(room) if room is not None else None
+        if decode_req is None:
+            return
+        req = decode_req.req
+        if (
+            req.multimodal_inputs is None
+            or decode_req.is_rebootstrap
+            or len(req.origin_input_ids) == length
+        ):
+            return
+        if not reconcile_mm_request_length(req, length):
+            logger.error(
+                "PD mm length reconcile: rid=%s could not realign to prefill's "
+                "%d tokens after registration; transfer will fail the length "
+                "checks as before",
+                req.rid,
+                length,
+            )
+            return
+        logger.info(
+            "PD mm length reconcile: rid=%s realigned decode expansion -> %d "
+            "tokens, re-registering destinations",
+            req.rid,
+            length,
+        )
+        self._resend_kv_metadata_after_inlen(decode_req)
+
+    def _resend_kv_metadata_after_inlen(self, decode_req: DecodeRequest) -> None:
+        """Re-register the transfer destinations of a request after its
+        expanded length was reconciled to the prefill-side authoritative
+        count. Mirrors the list-building in pop_preallocated() -- single
+        source of truth is that loop; keep the formulas in sync."""
+        req = decode_req.req
+        if self.scheduler.enable_hisparse:
+            logger.error(
+                "PD mm length reconcile: hisparse re-registration not "
+                "supported yet (rid=%s)",
+                req.rid,
+            )
+            return
+        total_prefix_len = req.kv.cache_protected_len or 0
+        page_size = self.token_to_kv_pool_allocator.page_size
+        seq_len = self._rebootstrap_prefill_len(req)
+
+        raw_kv_indices = self.req_to_token_pool.req_to_token[
+            decode_req.req.kv.req_pool_idx
+        ][total_prefix_len:seq_len]
+        kv_indices = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+            raw_kv_indices
+        )
+
+        def _mamba_payload():
+            return [
+                self.req_to_token_pool.translate_mamba_indices(
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        decode_req.req.kv.req_pool_idx
+                    ]
+                )
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload():
+            window_size = self.scheduler.sliding_window_size
+            window_start = max(total_prefix_len, seq_len - window_size)
+            window_start = page_align_floor(window_start, page_size)
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.kv.req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa, page_size)
+
+        def _full_kv_pages_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.kv.req_pool_idx, :seq_len
+            ]
+            device_page_size = self.token_to_kv_pool.page_size
+            return kv_to_page_indices(kv_indices_full, device_page_size)
+
+        def _dsa_tail_payload():
+            return get_dsa_tail_state_indices(
+                self.token_to_kv_pool,
+                decode_req.req.kv.req_pool_idx,
+                seq_len,
+            )
+
+        def _qsa_pending_payload():
+            return get_qsa_pending_state_indices(decode_req.req)
+
+        def _swa_ring_payload():
+            ring_stride = self.token_to_kv_pool.unified_swa_ring_size
+            window_size = self.token_to_kv_pool.unified_swa_window
+            window_start = max(0, seq_len - window_size)
+            positions = np.arange(window_start, seq_len, dtype=np.int64)
+            state_slot = int(decode_req.req.kv.req_pool_idx)
+            ring_rows = state_slot * ring_stride + (positions % ring_stride)
+            return ring_rows.astype(np.int32)
+
+        def _request_state_payload():
+            return self.token_to_kv_pool.request_state_transfer_indices(
+                int(decode_req.req.kv.req_pool_idx), seq_len
+            )
+
+        state_types = self.kv_manager.kv_args.state_types
+        payloads = {
+            StateType.MAMBA: _mamba_payload,
+            StateType.QSA_PENDING: _qsa_pending_payload,
+            StateType.QSA_COMPRESSED: _full_kv_pages_payload,
+            StateType.SWA: _swa_payload,
+            StateType.DSA: _full_kv_pages_payload,
+            StateType.DSA_TAIL: _dsa_tail_payload,
+            StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+            StateType.SWA_RING: _swa_ring_payload,
+            StateType.DSV4_REQUEST_STATE: _request_state_payload,
+            StateType.BLOCK_SCALE: _full_kv_pages_payload,
+            StateType.BLOCK_SCALE_SWA: _swa_payload,
+        }
+        state_indices: Optional[List] = [
+            payloads[st]() if st in payloads else None for st in state_types
+        ]
+
+        decode_req.kv_receiver.send_metadata(
+            kv_to_page_indices(kv_indices, page_size).astype(np.int32),
+            decode_req.metadata_buffer_index,
+            state_indices,
+            decode_prefix_len=total_prefix_len,
+        )
 
     @property
     def has_published_destinations(self) -> bool:
