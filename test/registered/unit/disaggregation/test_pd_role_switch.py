@@ -372,6 +372,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
 
 
 # --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---
+import queue  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 
@@ -483,6 +484,12 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         # ACKs, giving a side-effect-free probe of the receive loop.
         m.request_status = {}
         m._socket_send_locks = {}
+        # Control-plane replies (the ABORT_ACKs these tests assert on) are
+        # drained by the dedicated sender thread, mirroring the manager __init__
+        # wiring, so the ACK path stays exercised end to end.
+        m._control_reply_queue = queue.Queue(maxsize=8192)
+        m._control_replies_dropped = 0
+        m._start_control_reply_thread()
 
         def _connect(endpoint, is_ipv6=False):
             m._socket_send_locks.setdefault(endpoint, threading.Lock())
@@ -502,9 +509,10 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         self._ctx.destroy(linger=0)
 
     def _start(self):
+        # The reply sender was appended first (see setUp); the bootstrap
+        # thread is always the newest member of the worker pool.
         MooncakeKVManager.start_prefill_thread(self.m)
-        (thread,) = self.m._worker_threads
-        return thread
+        return self.m._worker_threads[-1]
 
     def _send_abort(self, room):
         self._push.send_multipart(

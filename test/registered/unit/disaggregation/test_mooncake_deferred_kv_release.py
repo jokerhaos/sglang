@@ -132,14 +132,21 @@ class TestMooncakeAbortNotification(
                 self.assertEqual(manager._sent, [])
 
     def test_feature_off_sends_legacy_ack(self):
+        # The legacy ACK must still be emitted, but via the fire-and-forget
+        # reply queue: a saturated decode endpoint must never stall the
+        # bootstrap consumer that used to send it inline (control-plane wedge).
         manager = _manager(enabled=False)
+        manager._enqueue_control_reply = MagicMock()
 
         claimed = manager._handle_abort_notification(self._abort_message())
 
         self.assertTrue(claimed)
         self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-        payload = manager._send_multipart_locked.call_args.args[1]
+        manager._enqueue_control_reply.assert_called_once()
+        endpoint, payload = manager._enqueue_control_reply.call_args.args[:2]
+        self.assertEqual(endpoint, f"tcp://{self.decode_ip}:{self.decode_port}")
         self.assertEqual(payload, [ABORT_ACK_TAG, str(ROOM).encode("ascii")])
+        self.assertEqual(manager._sent, [])
 
 
 if __name__ == "__main__":
