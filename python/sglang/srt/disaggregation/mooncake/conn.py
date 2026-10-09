@@ -4,6 +4,7 @@ import concurrent.futures
 import dataclasses
 import logging
 import os
+import queue
 import struct
 import threading
 import time
@@ -230,6 +231,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
         self.enable_trace = get_observability().enable_trace
+        # Control-plane replies (ABORT_ACK and friends) must never be sent
+        # inline by the threads that own the room-status tables. Under a
+        # client cancellation storm each inline send can stall up to the
+        # 30s sender SNDTIMEO against a saturated decode peer; a stalled
+        # bootstrap_thread stops delivering room registrations and every new
+        # room wedges in KVPoll.Bootstrapping until the 300s bootstrap
+        # timeout (production incident EXP-020: frontend success rate 0,
+        # pods Ready, only a prefill+decode restart recovered). ACKs are
+        # fire-and-forget bookkeeping for the peer, so drain them through a
+        # dedicated sender thread and never block the table owners.
+        self._control_reply_queue: "queue.Queue[Optional[Tuple[str, List[bytes], bool]]]" = queue.Queue(
+            maxsize=8192
+        )
+        self._control_replies_dropped = 0
+        self._start_control_reply_thread()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -265,13 +281,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
-            for i, (queue, executor) in enumerate(
+            for i, (shard_queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
                 threading.Thread(
                     target=self.transfer_worker,
                     args=(
-                        queue,
+                        shard_queue,
                         executor,
                         (
                             self._staging_ctx.buffers[i]
@@ -303,6 +319,67 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _start_control_reply_thread(self) -> None:
+        """Drain control-plane replies off the room-table owner threads.
+
+        Sends from this thread may block up to the sender SNDTIMEO; that is
+        fine here and exactly what must never happen on the bootstrap /
+        decode consumers.
+        """
+
+        def control_reply_thread():
+            while True:
+                endpoint, parts, is_ipv6 = self._control_reply_queue.get()
+                try:
+                    self._send_multipart_locked(endpoint, parts, is_ipv6=is_ipv6)
+                except Exception as e:
+                    logger.debug("Control reply send to %s failed: %s", endpoint, e)
+
+        threading.Thread(
+            target=control_reply_thread, name="MooncakeControlReply", daemon=True
+        ).start()
+
+    def _enqueue_control_reply(
+        self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
+    ) -> None:
+        """Queue a fire-and-forget control reply; never block the caller.
+
+        Drops with a counted warning when the peer is too slow to drain the
+        backlog. Decode treats a lost legacy ABORT_ACK as a no-op and a lost
+        deferred drain-ACK via its release timeout, so a drop degrades KV
+        page release latency at worst -- never correctness.
+        """
+        try:
+            self._control_reply_queue.put_nowait((endpoint, parts, is_ipv6))
+        except queue.Full:
+            self._control_replies_dropped += 1
+            if (
+                self._control_replies_dropped == 1
+                or self._control_replies_dropped % 1000 == 0
+            ):
+                logger.warning(
+                    "Control reply queue full; dropped %d replies so far",
+                    self._control_replies_dropped,
+                )
+
+    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
+        """Deferred-release drain ACK must not stall the transfer worker or the
+        bootstrap thread that conclude a room; send it via the reply queue
+        (same wire format as CommonKVManager._send_abort_ack)."""
+        try:
+            na = NetworkAddress(decode_ip, decode_port)
+        except Exception:
+            return
+        self._enqueue_control_reply(
+            na.to_tcp(),
+            [
+                b"ABORT_ACK",
+                str(room).encode("ascii"),
+                str(self._prefill_unique_rank()).encode("ascii"),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
@@ -2098,8 +2175,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
-                                    if req.mooncake_session_id not in self.failed_sessions:
-                                        KV_FAILURE_EVENTS.labels(event="session_failed").inc()
+                                    if (
+                                        req.mooncake_session_id
+                                        not in self.failed_sessions
+                                    ):
+                                        KV_FAILURE_EVENTS.labels(
+                                            event="session_failed"
+                                        ).inc()
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
@@ -2126,8 +2208,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         self.session_failures[
                                             req.mooncake_session_id
                                         ] += 1
-                                        if req.mooncake_session_id not in self.failed_sessions:
-                                            KV_FAILURE_EVENTS.labels(event="session_failed").inc()
+                                        if (
+                                            req.mooncake_session_id
+                                            not in self.failed_sessions
+                                        ):
+                                            KV_FAILURE_EVENTS.labels(
+                                                event="session_failed"
+                                            ).inc()
                                         self.failed_sessions.add(
                                             req.mooncake_session_id
                                         )
@@ -2230,137 +2317,193 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
+            msgs_processed = 0
+            stale_registrations = 0
+            last_heartbeat = time.perf_counter()
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[0].decode("ascii")
-                # Staging: decode reports consumption watermark back to prefill
-                if room == "WATERMARK":
-                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
-                # Staging: decode replies with allocated staging offset
-                if room == "STAGING_RSP":
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
-                # Decode-side abort notification: mark room as failed and ACK
-                if room == "ABORT":
-                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
-                    decode_ip = waiting_req_bytes[2].decode("ascii")
-                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    room_active = (
-                        room_to_be_aborted in self.request_status
-                        and self.check_status(room_to_be_aborted) != KVPoll.Success
-                    )
-                    if self.enable_deferred_decode_kv_release:
-                        # Mark Failed FIRST (stops add_transfer_request enqueuing
-                        # new chunks), THEN register the ack target: registering
-                        # first would let the worker drain+ack while the room is
-                        # not yet Failed, so a newly enqueued chunk could still
-                        # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
-                        if room_active:
-                            self.update_status(room_to_be_aborted, KVPoll.Failed)
-                            self.register_deferred_ack_target(
-                                room_to_be_aborted, decode_ip, decode_port
-                            )
-                            # Try once: the room may already be quiescent and
-                            # never revisited by the worker.
-                            self._maybe_ack_drained_abort(room_to_be_aborted)
-                            logger.debug(
-                                f"Received abort notification for room {room_to_be_aborted}, "
-                                f"marked as Failed; ACK deferred until transfer drains"
-                            )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
-                            self._send_abort_ack(
-                                decode_ip, decode_port, room_to_be_aborted
-                            )
-                        continue
-                    # No need to abort the room if it has already succeeded
-                    if room_active:
-                        self.update_status(room_to_be_aborted, KVPoll.Failed)
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"marked as Failed"
+                # This thread is the only consumer driving rooms out of
+                # KVPoll.Bootstrapping. A message it cannot handle must be
+                # logged and skipped, never fatal: a dead or wedged consumer
+                # wedges every new room on this rank (production incident
+                # EXP-020: no crash trace, pods stay Ready, only a restart
+                # recovers).
+                try:
+                    room = waiting_req_bytes[0].decode("ascii")
+                    # Staging: decode reports consumption watermark back to prefill
+                    if room == "WATERMARK":
+                        handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                    # Staging: decode replies with allocated staging offset
+                    elif room == "STAGING_RSP":
+                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    # Decode-side abort notification: mark room as failed and ACK
+                    elif room == "ABORT":
+                        room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                        decode_ip = waiting_req_bytes[2].decode("ascii")
+                        decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                        room_active = (
+                            room_to_be_aborted in self.request_status
+                            and self.check_status(room_to_be_aborted) != KVPoll.Success
                         )
+                        if self.enable_deferred_decode_kv_release:
+                            # Mark Failed FIRST (stops add_transfer_request enqueuing
+                            # new chunks), THEN register the ack target: registering
+                            # first would let the worker drain+ack while the room is
+                            # not yet Failed, so a newly enqueued chunk could still
+                            # write to the freed pages. The worker (not this thread)
+                            # acks once its in-flight write drains; if nothing is in
+                            # flight, decode falls back to the release timeout.
+                            if room_active:
+                                self.update_status(room_to_be_aborted, KVPoll.Failed)
+                                self.register_deferred_ack_target(
+                                    room_to_be_aborted, decode_ip, decode_port
+                                )
+                                # Try once: the room may already be quiescent and
+                                # never revisited by the worker.
+                                self._maybe_ack_drained_abort(room_to_be_aborted)
+                                logger.debug(
+                                    f"Received abort notification for room {room_to_be_aborted}, "
+                                    f"marked as Failed; ACK deferred until transfer drains"
+                                )
+                            elif (
+                                self._staging_outstanding.get(room_to_be_aborted, 0)
+                                == 0
+                            ):
+                                # Concluded/unknown AND quiescent: ack now. A cleared
+                                # room is not automatically quiescent -- clear() can
+                                # drop a room whose chunk is still transferring.
+                                self._send_abort_ack(
+                                    decode_ip, decode_port, room_to_be_aborted
+                                )
+                        else:
+                            # No need to abort the room if it has already succeeded
+                            if room_active:
+                                self.update_status(room_to_be_aborted, KVPoll.Failed)
+                                logger.debug(
+                                    f"Received abort notification for room {room_to_be_aborted}, "
+                                    f"marked as Failed"
+                                )
+                            else:
+                                logger.debug(
+                                    f"Received abort notification for room {room_to_be_aborted}, "
+                                    f"ignoring (already completed or unknown)"
+                                )
+                            # ACK to the decode endpoint: fire-and-forget queue,
+                            # never an inline send from this consumer.
+                            try:
+                                na = NetworkAddress(decode_ip, decode_port)
+                                self._enqueue_control_reply(
+                                    na.to_tcp(),
+                                    [
+                                        b"ABORT_ACK",
+                                        str(room_to_be_aborted).encode("ascii"),
+                                    ],
+                                    is_ipv6=na.is_ipv6,
+                                )
+                                logger.debug(
+                                    f"Sent ABORT_ACK for room {room_to_be_aborted} to "
+                                    f"{decode_ip}:{decode_port}"
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                                )
                     else:
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"ignoring (already completed or unknown)"
-                        )
-                    # Send ACK back to decode endpoint
-                    try:
-                        na = NetworkAddress(decode_ip, decode_port)
-                        self._send_multipart_locked(
-                            na.to_tcp(),
-                            [
-                                b"ABORT_ACK",
-                                str(room_to_be_aborted).encode("ascii"),
-                            ],
-                            is_ipv6=na.is_ipv6,
-                        )
-                        logger.debug(
-                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
-                            f"{decode_ip}:{decode_port}"
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
-                        )
-                    continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        num_entries = len(self.kv_args.kv_item_lens)
-                        num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                dst_item_lens,
-                                decode_kv_args.dst_dcp_size,
+                        mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                        if room == "None":
+                            decode_kv_args = KVArgsRegisterInfo.from_zmq(
+                                waiting_req_bytes
                             )
-                        )
-                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
-                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
-                    )
-                    continue
-                else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
+                            decode_kv_args.requires_dcp_relayout = (
+                                self.requires_dcp_relayout(
+                                    decode_kv_args.dst_dcp_size,
+                                    decode_kv_args.dst_dcp_rank,
+                                )
+                            )
+                            if decode_kv_args.requires_dcp_relayout:
+                                num_entries = len(self.kv_args.kv_item_lens)
+                                num_draft = self.kv_args.num_draft_entries
+                                dst_item_lens: List[Optional[int]] = [
+                                    decode_kv_args.dst_kv_item_len
+                                ] * (num_entries - num_draft) + [None] * num_draft
+                                decode_kv_args.dcp_token_item_lens = (
+                                    self.prepare_dcp_token_item_lens(
+                                        dst_item_lens,
+                                        decode_kv_args.dst_dcp_size,
+                                    )
+                                )
+                                self._init_dcp_pack_buffers_once(
+                                    decode_kv_args.dst_dcp_size
+                                )
+                            self.decode_kv_args_table[mooncake_session_id] = (
+                                decode_kv_args
+                            )
+                            with self.session_lock:
+                                if mooncake_session_id in self.failed_sessions:
+                                    self.failed_sessions.remove(mooncake_session_id)
+                                if mooncake_session_id in self.session_failures:
+                                    del self.session_failures[mooncake_session_id]
+                            logger.debug(
+                                f"Register KVArgs from {mooncake_session_id} successfully"
+                            )
+                        else:
+                            required_dst_info_num = int(
+                                waiting_req_bytes[7].decode("ascii")
+                            )
+                            room = int(room)
+                            if room not in self.request_status:
+                                # The room already concluded (timed out or was
+                                # aborted) and its sender cleared the table.
+                                # Accepting this late registration would
+                                # resurrect the room as WaitingForInput and
+                                # drive dead-end transfers for a request that
+                                # no longer exists.
+                                stale_registrations += 1
+                                logger.debug(
+                                    "Dropping late registration for room %s",
+                                    room,
+                                )
+                            else:
+                                if room not in self.transfer_infos:
+                                    self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                                self.transfer_infos[room][mooncake_session_id] = (
+                                    TransferInfo.from_zmq(waiting_req_bytes)
+                                )
+                                # NOTE: after bootstrapping we can mark the req as waiting for input
+                                if (
+                                    len(self.transfer_infos[room])
+                                    == required_dst_info_num
+                                ):
+                                    self.resolve_kv_replica_factor(
+                                        self.transfer_infos[room]
+                                    )
+                                    self.req_to_decode_prefix_len[room] = next(
+                                        (
+                                            info.decode_prefix_len
+                                            for info in self.transfer_infos[
+                                                room
+                                            ].values()
+                                            if info.decode_prefix_len is not None
+                                        ),
+                                        0,
+                                    )
+                                    self.update_status(room, KVPoll.WaitingForInput)
+                except Exception:
+                    logger.exception(
+                        "mooncake bootstrap_thread failed to process a message "
+                        "(first frame: %r)",
+                        waiting_req_bytes[0][:32] if waiting_req_bytes else b"<empty>",
                     )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        self.update_status(room, KVPoll.WaitingForInput)
+                msgs_processed += 1
+                now = time.perf_counter()
+                if now - last_heartbeat >= 60.0:
+                    logger.info(
+                        "mooncake bootstrap_thread alive: msgs=%d stale_registrations=%d",
+                        msgs_processed,
+                        stale_registrations,
+                    )
+                    last_heartbeat = now
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2368,57 +2511,67 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def decode_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
-                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
-                    self._handle_aux_data(msg)
-                    continue
+                # Same hardening as the prefill bootstrap_thread: a message it
+                # cannot handle must be logged and skipped, never fatal --
+                # this consumer drives room status updates on decode.
+                try:
+                    if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+                        self._handle_aux_data(msg)
+                        continue
 
-                # Staging: prefill notifies a chunk written to staging buffer
-                if msg[0] == b"CHUNK_READY":
-                    room = int(msg[1].decode("ascii"))
-                    chunk_idx = int(msg[2].decode("ascii"))
-                    page_start = int(msg[3].decode("ascii"))
-                    num_pages = int(msg[4].decode("ascii"))
-                    session_id = msg[5].decode("ascii")
-                    handler = self._staging_handler
-                    assert handler is not None, (
-                        "CHUNK_READY received before staging handler initialized"
-                    )
-                    handler.handle_chunk_arrived(
-                        room,
-                        chunk_idx,
-                        page_start,
-                        num_pages,
-                        session_id,
-                    )
-                    continue
-
-                # Staging: prefill pre-requests staging allocation before forward
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
-                    continue
-
-                # Prefill acknowledges abort notification
-                if msg[0] == b"ABORT_ACK":
-                    ack_aborted_room = int(msg[1].decode("ascii"))
-                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
-                    # Deferred release: the 3-frame ack carries the prefill rank
-                    # and means its transfer drained; aggregate for is_abort_release_safe.
-                    if self.enable_deferred_decode_kv_release and len(msg) >= 3:
-                        self.note_abort_ack(
-                            ack_aborted_room, int(msg[2].decode("ascii"))
+                    # Staging: prefill notifies a chunk written to staging buffer
+                    if msg[0] == b"CHUNK_READY":
+                        room = int(msg[1].decode("ascii"))
+                        chunk_idx = int(msg[2].decode("ascii"))
+                        page_start = int(msg[3].decode("ascii"))
+                        num_pages = int(msg[4].decode("ascii"))
+                        session_id = msg[5].decode("ascii")
+                        handler = self._staging_handler
+                        assert handler is not None, (
+                            "CHUNK_READY received before staging handler initialized"
                         )
-                    continue
+                        handler.handle_chunk_arrived(
+                            room,
+                            chunk_idx,
+                            page_start,
+                            num_pages,
+                            session_id,
+                        )
+                        continue
 
-                parsed = self.parse_kv_status_message(msg)
-                if parsed is None:
-                    continue
-                room, status, prefill_rank, reason = parsed
-                self.apply_prefill_status(
-                    bootstrap_room=room,
-                    status=status,
-                    prefill_rank=prefill_rank,
-                    failure_reason=reason,
-                )
+                    # Staging: prefill pre-requests staging allocation before forward
+                    if msg[0] == b"STAGING_REQ":
+                        self._handle_staging_req(msg)
+                        continue
+
+                    # Prefill acknowledges abort notification
+                    if msg[0] == b"ABORT_ACK":
+                        ack_aborted_room = int(msg[1].decode("ascii"))
+                        logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                        # Deferred release: the 3-frame ack carries the prefill rank
+                        # and means its transfer drained; aggregate for is_abort_release_safe.
+                        if self.enable_deferred_decode_kv_release and len(msg) >= 3:
+                            self.note_abort_ack(
+                                ack_aborted_room, int(msg[2].decode("ascii"))
+                            )
+                        continue
+
+                    parsed = self.parse_kv_status_message(msg)
+                    if parsed is None:
+                        continue
+                    room, status, prefill_rank, reason = parsed
+                    self.apply_prefill_status(
+                        bootstrap_room=room,
+                        status=status,
+                        prefill_rank=prefill_rank,
+                        failure_reason=reason,
+                    )
+                except Exception:
+                    logger.exception(
+                        "mooncake decode_thread failed to process a message "
+                        "(first frame: %r)",
+                        msg[0][:32] if msg else b"<empty>",
+                    )
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
