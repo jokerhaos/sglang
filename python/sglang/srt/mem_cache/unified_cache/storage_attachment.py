@@ -378,6 +378,9 @@ class StorageAttachment:
         for handle in list(cache.ongoing_prefetch):
             info = cache.ongoing_prefetch[handle]
             try:
+                info.operation.storage_trace.finish(
+                    "cancelled", info.operation.completed_tokens
+                )
                 cache.discard_storage_prefetch_accounting(handle)
                 if info.host_indices is None:
                     # Host pages were never allocated for this operation.

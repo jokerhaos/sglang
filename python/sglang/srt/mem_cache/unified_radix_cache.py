@@ -377,6 +377,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        for info in getattr(self, "ongoing_prefetch", {}).values():
+            info.operation.storage_trace.finish(
+                "cancelled", info.operation.completed_tokens
+            )
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -2099,6 +2103,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if not should_terminate:
             return False
 
+        if (
+            operation.host_indices is None
+            or operation.completed_tokens < operation.storage_hit_count
+        ):
+            operation.storage_trace.finish(
+                "timeout" if self.prefetch_stop_policy == "timeout" else "early_stop",
+                operation.completed_tokens,
+            )
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             self.storage_prefetch_retries.poll_miss(request.rid)
@@ -2143,6 +2155,13 @@ class UnifiedRadixCache(BasePrefixCache):
             # Hybrid all-or-nothing check failed; result already discarded.
             return
 
+        # Storage IO is complete; buffer-mode admission may happen on a later pass.
+        operation.storage_trace.finish(
+            "complete"
+            if completed_tokens == operation.storage_hit_count
+            else "partial",
+            completed_tokens,
+        )
         allocated_tokens = len(host_indices)
         if completed_tokens < allocated_tokens:
             self._resolve_storage_prefetch_tokens(
@@ -2278,6 +2297,7 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
+            operation.storage_trace.finish("partial", 0)
             # Drop the KV beliefs from the first page any pool failed to serve;
             # the next insert then re-writes that span through one FULL check,
             # restoring the missing aux pages.
@@ -2466,6 +2486,7 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[request]
+        operation.storage_trace.finish("cancelled", operation.completed_tokens)
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self.revoke_pending_prefetch(request)
@@ -2615,7 +2636,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         return info, hit_tokens - trim_tokens, original_hit_tokens
 
-    def revoke_pending_prefetch(self, request: CacheRequestHandle) -> None:
+    def revoke_pending_prefetch(
+        self, request: CacheRequestHandle, outcome: str = "fallback"
+    ) -> None:
         info = self.ongoing_prefetch.pop(request, None)
         self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
         if info is None:
@@ -2628,6 +2651,7 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        operation.storage_trace.finish(outcome, operation.completed_tokens)
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(request)
@@ -2756,7 +2780,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
-                self.revoke_pending_prefetch(request)
+                self.revoke_pending_prefetch(request, "allocation_failed")
                 self.storage_prefetch_retries.poll_miss(
                     request.rid, operation.storage_start + operation.storage_hit_count
                 )
@@ -2776,7 +2800,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
-                self.revoke_pending_prefetch(request)
+                self.revoke_pending_prefetch(request, "allocation_failed")
                 self.storage_prefetch_retries.poll_miss(
                     request.rid, operation.storage_start + operation.storage_hit_count
                 )
@@ -2835,7 +2859,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     # without this, store misses never reach l3_miss_tokens.
                     self._account_prefetch_outcome(operation, revoked=True)
                     self.storage_prefetch_retries.poll_miss(request.rid)
-                    self.revoke_pending_prefetch(request)
+                    self.revoke_pending_prefetch(
+                        request, "miss" if hit_tokens == 0 else "below_threshold"
+                    )
                     continue
                 if hit_tokens < self.prefetch_threshold:
                     # Below-threshold hits are not worth the transfer.
@@ -2844,7 +2870,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         request, fulfilled_tokens=0, reason="below_threshold"
                     )
                     self.storage_prefetch_retries.poll_miss(request.rid)
-                    self.revoke_pending_prefetch(request)
+                    self.revoke_pending_prefetch(
+                        request, "miss" if hit_tokens == 0 else "below_threshold"
+                    )
                     continue
                 self._invalidate_absent_from_hit_query(operation)
                 self._account_prefetch_outcome(operation, revoked=False)
