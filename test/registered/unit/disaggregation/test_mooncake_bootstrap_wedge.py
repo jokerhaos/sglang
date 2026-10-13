@@ -59,6 +59,7 @@ class _WedgeTestManager(MooncakeKVManager):
         self.transfer_infos = {}
         self.req_to_decode_prefix_len = {}
         self.failure_records = {}
+        self.failure_lock = threading.Lock()
         self._staging_outstanding = {}
         self._deferred_ack_targets = {}
         self.enable_deferred_decode_kv_release = False
@@ -293,6 +294,88 @@ class TestBootstrapThreadHardening(CustomTestCase):
             "healthy room did not leave KVPoll.Bootstrapping",
         )
         self.assertIn(789, self.mgr.transfer_infos)
+
+    def test_late_registration_failure_notify_rides_queue(self):
+        # A room that concluded as Failed (e.g. prefill's bootstrap timeout
+        # fired before decode's registration arrived) must have its root
+        # cause forwarded to the late registration's decode endpoint so the
+        # waiting receiver aborts immediately instead of sitting in
+        # WaitingForInput until SGLANG_DISAGGREGATION_WAITING_TIMEOUT.
+        # The push must go through the non-blocking control-reply queue --
+        # never an inline send from the bootstrap consumer (wedge class).
+        self.mgr.record_failure(77, "Request 77 timed out in KVPoll.Bootstrapping")
+        self.mgr.request_status[78] = KVPoll.Bootstrapping
+        self.mgr.push_message(self.mgr._registration_frames(77))
+        self.mgr.push_message(self.mgr._registration_frames(78))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(78) == KVPoll.WaitingForInput
+            ),
+            "barrier room did not bootstrap",
+        )
+        # Room 77 dropped, not resurrected.
+        self.assertNotIn(77, self.mgr.request_status)
+        self.assertNotIn(77, self.mgr.transfer_infos)
+        # A Failed status push toward the registration's endpoint
+        # (127.0.0.1:12349) carrying the recorded reason is queued
+        # fire-and-forget.
+        got = []
+        while True:
+            try:
+                got.append(self.mgr._control_reply_queue.get_nowait())
+            except queue.Empty:
+                break
+        self.assertEqual(len(got), 1, f"expected exactly one queued notify: {got}")
+        endpoint, parts, is_ipv6 = got[0]
+        self.assertEqual(endpoint, "tcp://127.0.0.1:12349")
+        self.assertEqual(parts[0], b"77")
+        self.assertEqual(parts[1], str(int(KVPoll.Failed)).encode("ascii"))
+
+    def test_late_registration_without_failure_stays_silent(self):
+        # A late registration for a room with no recorded failure (e.g. an
+        # already-Successful room receiving a duplicate) must NOT trigger a
+        # doomed Failed push -- the current silent drop is the correct
+        # behavior for it.
+        self.mgr.request_status[79] = KVPoll.Bootstrapping
+        self.mgr.push_message(self.mgr._registration_frames(76))
+        self.mgr.push_message(self.mgr._registration_frames(79))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(79) == KVPoll.WaitingForInput
+            ),
+            "barrier room did not bootstrap",
+        )
+        self.assertTrue(
+            self.mgr._control_reply_queue.empty(),
+            "no notify should be sent without a recorded failure",
+        )
+
+    def test_late_registration_failure_notify_bad_endpoint(self):
+        # Frames that don't carry a usable endpoint are skipped without
+        # raising and without killing the consumer (the whole branch is
+        # inside the thread's exception guard, but the helper must not
+        # depend on that).
+        self.mgr.record_failure(74, "Request 74 aborted")
+        self.mgr.request_status[75] = KVPoll.Bootstrapping
+
+        class FakeBytes(bytes):
+            def decode(self, *a, **k):
+                raise UnicodeDecodeError("ascii", b"", 0, 1, "bad")
+
+        bad = self.mgr._registration_frames(74)
+        bad[1] = FakeBytes(b"\xff")
+        self.mgr.push_message(bad)
+        self.mgr.push_message(self.mgr._registration_frames(75))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(75) == KVPoll.WaitingForInput
+            ),
+            "consumer died on a bad endpoint frame",
+        )
+        self.assertTrue(self.mgr._control_reply_queue.empty())
 
 
 if __name__ == "__main__":

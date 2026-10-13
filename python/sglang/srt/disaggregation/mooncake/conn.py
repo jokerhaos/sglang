@@ -2570,6 +2570,44 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if trace_token is not None:
                     tracing.context.detach(trace_token)
 
+    def _notify_late_registration_failure(
+        self, room: int, registration_frames: List[bytes], failure_reason: str
+    ) -> None:
+        """Tell a late-registered decode endpoint its room already failed.
+
+        The room concluded (timeout or abort) before this registration
+        arrived, so the normal conclude path had no target to notify. The
+        registration frames carry the waiting endpoint, making this the only
+        message that knows where the receiver lives. The status push rides the
+        fire-and-forget control-reply queue (never an inline send, per the
+        bootstrap-wedge hardening): a drop or a slow peer costs the notify,
+        not the consumer.
+        """
+        try:
+            endpoint = registration_frames[1].decode("ascii")
+            dst_port = int(registration_frames[2].decode("ascii"))
+        except (IndexError, UnicodeDecodeError, ValueError):
+            logger.debug(
+                "Late registration for room %s carried no usable endpoint", room
+            )
+            return
+        KV_FAILURE_EVENTS.labels(event="late_registration_failure_notify").inc()
+        logger.warning(
+            "Room %s already concluded (%s); notifying its late-registered "
+            "decode endpoint %s:%s to abort instead of waiting",
+            room,
+            failure_reason,
+            endpoint,
+            dst_port,
+        )
+        parts = self._encode_kv_status_message(
+            bootstrap_room=room,
+            status=KVPoll.Failed,
+            failure_reason=failure_reason,
+        )
+        na = NetworkAddress(endpoint, dst_port)
+        self._enqueue_control_reply(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+
     def start_prefill_thread(self):
         recv = self._make_worker_recv(self.server_socket)
 
@@ -2720,6 +2758,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             "Dropping late registration for room %s",
                             room,
                         )
+                        # The registration's frames prove this decode
+                        # endpoint still owns the room and is waiting on
+                        # it (decode registers exactly once, when the
+                        # request is dispatched). A concluded room only
+                        # carries a recorded failure root cause, so when
+                        # one exists -- e.g. prefill's
+                        # SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT fired
+                        # before the registration arrived (transport-
+                        # endpoint re-handshake storm on a fresh PD
+                        # generation) -- forward it so decode aborts now
+                        # instead of waiting out its own
+                        # SGLANG_DISAGGREGATION_WAITING_TIMEOUT with no
+                        # knowledge that the sender already gave up.
+                        with self.failure_lock:
+                            recorded_failure = self.failure_records.get(room)
+                        if recorded_failure is not None:
+                            self._notify_late_registration_failure(
+                                room, waiting_req_bytes, recorded_failure
+                            )
                         continue
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
