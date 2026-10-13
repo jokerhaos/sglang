@@ -370,6 +370,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
 
 
 # --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---
+import queue  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 
@@ -487,6 +488,13 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
             return m._connect.return_value
 
         m._connect = MagicMock(side_effect=_connect)
+        # astro: ABORT_ACKs ride the fire-and-forget control-reply queue --
+        # never an inline send from the bootstrap consumer (wedge hardening).
+        # Start the real drainer so queued replies reach _connect() and the
+        # ack counters below observe them, mirroring the production wiring.
+        m._control_reply_queue = queue.Queue(maxsize=8192)
+        m._control_replies_dropped = 0
+        MooncakeKVManager._start_control_reply_thread(m)
         self.m = m
         self._push = self._ctx.socket(zmq.PUSH)
         self._push.connect(f"tcp://127.0.0.1:{port}")
@@ -501,7 +509,9 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
 
     def _start(self):
         MooncakeKVManager.start_prefill_thread(self.m)
-        (thread,) = self.m._worker_threads
+        (thread,) = [
+            t for t in self.m._worker_threads if t.name != "MooncakeControlReply"
+        ]
         return thread
 
     def _send_abort(self, room):

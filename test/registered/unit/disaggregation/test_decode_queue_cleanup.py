@@ -124,6 +124,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
+        queue._room_to_req = {}  # astro INLEN room tracking (real __init__ owns it)
         queue._resolve_pending_reqs = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         # `_uses_swa_reservation` consults the allocator once tail prealloc is
@@ -182,6 +183,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]  # same object, dual ownership
         queue.retracted_queue = []
+        queue._room_to_req = {}  # astro INLEN room tracking (real __init__ owns it)
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
@@ -218,6 +220,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             finished_reason=None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=1),
+            multimodal_inputs=None,  # astro INLEN prealloc check reads this
         )
         decode_req = SimpleNamespace(
             req=req,
@@ -231,6 +234,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]
         queue.retracted_queue = []
+        queue._room_to_req = {}  # astro INLEN room tracking (real __init__ owns it)
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()

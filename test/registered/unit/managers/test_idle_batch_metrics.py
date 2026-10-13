@@ -9,6 +9,8 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.observability.metrics_collector import QueueCount
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -16,6 +18,11 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestIdleBatchMetrics(unittest.TestCase):
     def setUp(self):
+        # v0.5.21 routes the idle publish through _update_decode_queue_stats(),
+        # which reads the disagg config bag via get_disagg(): publish one.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
         # Exercise the real result handler and metrics reporter without a model.
         self.reporter = object.__new__(metrics_reporter.SchedulerMetricsReporter)
         self.reporter.current_scheduler_metrics_enabled = True

@@ -49,6 +49,9 @@ class TestKVFailureEventMetrics(CustomTestCase):
                 receiver = SimpleNamespace(
                     bootstrap_room=7, abort_notified=True,
                     kv_mgr=SimpleNamespace(record_failure=Mock(), update_status=Mock()),
+                    # v0.5.21 abort() now ends with ensure_abort_notified();
+                    # the event metric test does not exercise the notify path.
+                    ensure_abort_notified=lambda **kw: None,
                 )
                 cls.abort(receiver)
                 events.labels.assert_called_once_with(event="abort")

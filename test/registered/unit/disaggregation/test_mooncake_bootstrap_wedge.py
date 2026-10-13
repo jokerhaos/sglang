@@ -18,6 +18,7 @@ hardening properties:
 import queue
 import threading
 import time
+import types
 import unittest
 from typing import Callable
 
@@ -73,6 +74,15 @@ class _WedgeTestManager(MooncakeKVManager):
         self.server_socket = None
         self._zmq_ctx = None
         self._push_socket = None
+        # v0.5.21 teardown/abort-fanout bookkeeping owned by the real
+        # MooncakeKVManager.__init__ (skipped above); the shell must mirror
+        # it because the control-plane paths touch these too.
+        self._stopped = False
+        self._worker_threads = []
+        self._deferred_ack_fanout_snapshots = {}
+        # _make_worker_recv() reads server_args.enable_pd_role_switch; the
+        # shell keeps the plain blocking recv (pre-v0.5.21 semantics).
+        self.server_args = types.SimpleNamespace(enable_pd_role_switch=False)
 
     def with_bind_socket(self) -> None:
         self._zmq_ctx = zmq.Context()
@@ -88,15 +98,20 @@ class _WedgeTestManager(MooncakeKVManager):
         self._push_socket.send_multipart(frames)
 
     def shutdown(self) -> None:
-        # Wake the consumer parked in a blocking recv with a benign message
-        # so the thread finishes its current iteration instead of dying on a
-        # closed socket (rooms absent from request_status are dropped by the
-        # zombie gate, so room 0 is inert).
+        # Ask the consumer loops to exit, then wake any thread parked in a
+        # blocking recv with a benign message so it finishes its current
+        # iteration and observes _stopped (rooms absent from request_status
+        # are dropped by the zombie gate, so room 0 is inert). Join the
+        # workers BEFORE closing sockets: closing a context underneath a
+        # blocked recv aborts the process.
+        self._stopped = True
         if getattr(self, "_push_socket", None) is not None:
             try:
                 self._push_socket.send_multipart(self._registration_frames(0))
             except Exception:
                 pass
+        for t in getattr(self, "_worker_threads", []):
+            t.join(timeout=5.0)
         if getattr(self, "_push_socket", None) is not None:
             self._push_socket.close(linger=0)
         if self.server_socket is not None:

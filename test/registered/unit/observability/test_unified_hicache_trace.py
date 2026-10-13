@@ -4,6 +4,7 @@ import threading
 import unittest
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -29,6 +30,11 @@ from sglang.srt.observability import trace as tracing
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+
+@contextmanager
+def _noop_layout_lease():
+    yield
 
 
 class TestUnifiedHiCacheTrace(unittest.TestCase):
@@ -74,11 +80,20 @@ class TestUnifiedHiCacheTrace(unittest.TestCase):
         controller.prefetch_tokens_occupied = 0
         controller.prefetch_capacity_limit = 16
         controller.host_memory_mode = "cache"
+        # v0.5.21 PP-prefetch command gate (real __init__ defaults it to None:
+        # make get_prefetch_submission() a no-op, as in a non-PP deployment).
+        controller.pp_prefetch_command_group = None
+        controller.pp_prefetch_decisions = {}
+        # Base CacheController.__init__ bookkeeping (page_backup appends here).
+        controller.write_queue = []
         controller.mem_pool_host = SimpleNamespace(
             alloc=lambda size: torch.arange(size),
             free=Mock(),
             page_size=2,
             available_size=lambda: 0,
+            # v0.5.21 _page_transfer wraps the transfer in a host-pool layout
+            # lease; a no-op lease stands in for the real compaction lock.
+            layout_lease=lambda: _noop_layout_lease(),
         )
         controller.storage_backend = SimpleNamespace(
             batch_exists=lambda keys, extra_info: min(hit_pages, len(keys)),
