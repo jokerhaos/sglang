@@ -13,6 +13,20 @@ hardening properties:
 - a malformed message is logged and skipped without killing the consumer;
 - a late registration for an already-concluded room is dropped instead of
   resurrecting the room as WaitingForInput.
+
+Follow-up hardening (early-registration lifecycle): the decode leg can
+register a room BEFORE the prefill scheduler creates the room's sender
+(burst tokenization / a multi-second run_batch delays ingest), and decode
+never re-sends a registration -- dropping it wedged rooms until the
+bootstrap timeout (16 rooms/90s under C=32 bursts). These tests pin:
+
+- an early registration is accepted and the room completes bootstrap even
+  though the sender arrives after the registration;
+- the sender's later Bootstrapping status never demotes WaitingForInput
+  (max() ordering in update_status);
+- registration for a Failed room is dropped (terminal state);
+- unclaimed early rooms and expired tombstones are reclaimed by the
+  sweep, and claimed/fresh rooms are left alone.
 """
 
 import queue
@@ -81,6 +95,15 @@ class _WedgeTestManager(MooncakeKVManager):
         self._stopped = False
         self._worker_threads = []
         self._deferred_ack_fanout_snapshots = {}
+        # Early-registration lifecycle bookkeeping (mirrors the real
+        # MooncakeKVManager PREFILL branch; see MooncakeKVSender.clear /
+        # on_sender_created / sweep_stale_rooms).
+        self._room_lifecycle_lock = threading.Lock()
+        self._concluded_rooms = {}
+        self._early_rooms = {}
+        self._early_registrations = 0
+        self.tombstone_ttl_s = 360.0
+        self.early_room_ttl_s = 150.0
         # _make_worker_recv() reads server_args.enable_pd_role_switch; the
         # shell keeps the plain blocking recv (pre-v0.5.21 semantics).
         self.server_args = types.SimpleNamespace(enable_pd_role_switch=False)
@@ -123,16 +146,21 @@ class _WedgeTestManager(MooncakeKVManager):
             except zmq.ZMQError:
                 pass
 
-    def _registration_frames(self, room: int):
+    def _registration_frames(
+        self,
+        room: int,
+        session: bytes = b"sess-1",
+        required_dst_info_num: int = 1,
+    ):
         return [
             str(room).encode("ascii"),
             b"127.0.0.1",
             b"12349",
-            b"sess-1",
+            session,
             np.array([0, 1, 2], dtype=np.int32).tobytes(),
             b"5",
             pack_int_lists([], "i"),
-            b"1",  # required_dst_info_num = 1
+            str(required_dst_info_num).encode("ascii"),
             b"0",  # decode_prefix_len
         ]
 
@@ -265,11 +293,14 @@ class TestBootstrapThreadHardening(CustomTestCase):
         )
 
     def test_late_registration_dropped_without_resurrection(self):
-        # Room 123 has no entry in request_status (timed out / aborted and
-        # cleared). A late registration must not resurrect it. Pushing a
-        # valid room-124 registration afterwards is the consumption barrier:
+        # Room 123 concluded and its sender cleared the table -- modeled
+        # by a tombstone (a room merely absent from request_status may
+        # instead be one whose prefill sender has not been created yet).
+        # A late registration must not resurrect it. Pushing a valid
+        # room-124 registration afterwards is the consumption barrier:
         # the per-socket FIFO proves 123 was processed by the time 124
         # reaches WaitingForInput.
+        self.mgr.note_room_concluded(123)
         self.mgr.request_status[124] = KVPoll.Bootstrapping
         self.mgr.push_message(self.mgr._registration_frames(123))
         self.mgr.push_message(self.mgr._registration_frames(124))
@@ -376,6 +407,151 @@ class TestBootstrapThreadHardening(CustomTestCase):
             "consumer died on a bad endpoint frame",
         )
         self.assertTrue(self.mgr._control_reply_queue.empty())
+
+
+class TestEarlyRegistrationLifecycle(CustomTestCase):
+    def setUp(self):
+        self.mgr = _WedgeTestManager()
+        self.mgr.with_bind_socket()
+        self.mgr._send_multipart_locked = lambda endpoint, parts, is_ipv6=False: None
+        self.mgr.start_prefill_thread()
+
+    def tearDown(self):
+        self.mgr.shutdown()
+
+    def _simulate_sender_creation(self, room: int):
+        # One-line equivalent of MooncakeKVSender.__init__: claim the room,
+        # then let the base class insert its opening Bootstrapping status.
+        self.mgr.on_sender_created(room)
+        self.mgr.update_status(room, KVPoll.Bootstrapping)
+
+    def test_early_registration_accepted_before_sender(self):
+        # Decode registered the room while the prefill leg is still behind
+        # tokenization / a running batch (no request_status entry yet, no
+        # tombstone). Dropping this registration is exactly the bug that
+        # wedged 16 rooms for the 90s bootstrap timeout under C=32 bursts.
+        self.mgr.push_message(self.mgr._registration_frames(300))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(300) == KVPoll.WaitingForInput
+            ),
+            "early registration was not accepted",
+        )
+        self.assertIn(300, self.mgr.transfer_infos)
+        self.assertGreaterEqual(self.mgr._early_registrations, 1)
+
+    def test_early_registration_survives_late_sender_creation(self):
+        self.mgr.push_message(self.mgr._registration_frames(301))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(301) == KVPoll.WaitingForInput
+            ),
+            "early registration was not accepted",
+        )
+
+        self._simulate_sender_creation(301)
+
+        self.assertEqual(
+            self.mgr.request_status.get(301),
+            KVPoll.WaitingForInput,
+            "sender's Bootstrapping status demoted the early registration",
+        )
+        self.assertNotIn(301, self.mgr._early_rooms)
+
+    def test_partial_early_registration_completes_after_sender_claim(self):
+        # With required_dst_info_num=2 the first registration parks the room
+        # as pending; the sender claims the room; the second decode rank's
+        # registration completes the bootstrap. This pins the multi-rank
+        # burst ordering (first registration before the sender, second one
+        # after it).
+        self.mgr.push_message(
+            self.mgr._registration_frames(
+                302, session=b"sess-a", required_dst_info_num=2
+            )
+        )
+        self.assertTrue(
+            _wait_for(lambda: 302 in self.mgr._early_rooms),
+            "first early registration was not tracked",
+        )
+        self.assertIsNone(self.mgr.request_status.get(302))
+        self.assertEqual(len(self.mgr.transfer_infos.get(302, {})), 1)
+
+        self._simulate_sender_creation(302)
+
+        self.mgr.push_message(
+            self.mgr._registration_frames(
+                302, session=b"sess-b", required_dst_info_num=2
+            )
+        )
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(302) == KVPoll.WaitingForInput
+            ),
+            "room did not bootstrap after its registrations completed",
+        )
+        self.assertEqual(len(self.mgr.transfer_infos[302]), 2)
+
+    def test_failed_room_registration_dropped(self):
+        # Failed is terminal: a registration for it must not resurrect or
+        # re-arm any state.
+        self.mgr.request_status[303] = KVPoll.Failed
+        self.mgr.request_status[305] = KVPoll.Bootstrapping  # consumption barrier
+        self.mgr.push_message(self.mgr._registration_frames(303))
+        self.mgr.push_message(self.mgr._registration_frames(305))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(305) == KVPoll.WaitingForInput
+            ),
+            "barrier room did not bootstrap",
+        )
+        self.assertEqual(self.mgr.request_status.get(303), KVPoll.Failed)
+        self.assertNotIn(303, self.mgr.transfer_infos)
+        self.assertNotIn(303, self.mgr._early_rooms)
+
+    def test_sweep_reclaims_unclaimed_rooms_and_expired_tombstones(self):
+        self.mgr.push_message(self.mgr._registration_frames(306))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(306) == KVPoll.WaitingForInput
+            ),
+            "early registration was not accepted",
+        )
+        # Age the early room past its TTL; it never got claimed by a sender.
+        self.mgr._early_rooms[306] = time.monotonic() - self.mgr.early_room_ttl_s - 5.0
+        # A tombstone past its TTL.
+        self.mgr.note_room_concluded(307)
+        self.mgr._concluded_rooms[307] = (
+            time.monotonic() - self.mgr.tombstone_ttl_s - 5.0
+        )
+
+        self.mgr.sweep_stale_rooms()
+
+        self.assertNotIn(306, self.mgr.request_status)
+        self.assertNotIn(306, self.mgr.transfer_infos)
+        self.assertNotIn(306, self.mgr._early_rooms)
+        self.assertNotIn(307, self.mgr._concluded_rooms)
+
+    def test_sweep_preserves_fresh_and_claimed_rooms(self):
+        self.mgr.push_message(self.mgr._registration_frames(308))
+
+        self.assertTrue(
+            _wait_for(
+                lambda: self.mgr.request_status.get(308) == KVPoll.WaitingForInput
+            ),
+            "early registration was not accepted",
+        )
+        # A claimed room is no longer the sweep's business even if its
+        # recorded timestamp were (artificially) old.
+        self._simulate_sender_creation(308)
+
+        self.mgr.sweep_stale_rooms()
+
+        self.assertEqual(self.mgr.request_status.get(308), KVPoll.WaitingForInput)
+        self.assertIn(308, self.mgr.transfer_infos)
 
 
 if __name__ == "__main__":

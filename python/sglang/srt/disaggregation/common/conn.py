@@ -61,7 +61,7 @@ KV_FAILURE_EVENTS = Counter(
 for _event in (
     "bootstrap_timeout", "transfer_timeout", "abort", "session_failed",
     "session_recovered", "index_mismatch", "transfer_thread_failed",
-    "transfer_failed", "metadata_invalid",
+    "transfer_failed", "metadata_invalid", "registration_dropped",
 ):
     KV_FAILURE_EVENTS.labels(event=_event).inc(0)
 

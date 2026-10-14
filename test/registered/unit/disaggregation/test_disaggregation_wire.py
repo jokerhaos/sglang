@@ -82,6 +82,11 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
                 manager._deferred_ack_fanout_snapshots = {}
                 manager.transfer_infos = {}
+                # Early-registration lifecycle state touched by
+                # MooncakeKVSender.clear()'s tombstone (see the real
+                # MooncakeKVManager PREFILL branch).
+                manager._room_lifecycle_lock = threading.Lock()
+                manager._concluded_rooms = {}
                 with patch.object(manager, "_send_abort_ack") as ack:
                     sender.clear()
                     if outstanding:
