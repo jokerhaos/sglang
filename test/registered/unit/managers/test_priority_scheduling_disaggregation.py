@@ -427,6 +427,12 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             sampling_params=SimpleNamespace(max_new_tokens=8),
             kv=ReqKvInfo(req_pool_idx=int(priority) % 8, cache_protected_len=0),
             time_stats=MagicMock(),
+            # Real Request objects always carry this; the decode prealloc
+            # path's mm input-length handling reads it.
+            multimodal_inputs=None,
+            # Optional on the real field too: pop_preallocated only joins the
+            # room->request reconciliation table when a room is present.
+            bootstrap_room=None,
         )
         return SimpleNamespace(
             req=req,
@@ -443,6 +449,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.queue = list(decode_reqs)
         queue.pending_reqs = []
         queue.retracted_queue = []
+        # `pop_preallocated` also walks this room->request table (its __init__
+        # companion lives next to `pending_reqs` seeding; __new__ skips it).
+        queue._room_to_req = {}
         queue.num_reserved_decode_tokens = 0
         # `pop_preallocated` credits this counter; `__new__` skips the __init__
         # that seeds it.

@@ -38,8 +38,8 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                 return_value=([1000, 2000], [5000, 6000], 2)
             ),
         )
-        manager._transfer_data = lambda session, blocks: (
-            MooncakeKVManager._transfer_data(manager, session, blocks)
+        manager._transfer_data = lambda session, blocks, trace_carrier=None: (
+            MooncakeKVManager._transfer_data(manager, session, blocks, trace_carrier)
         )
         manager._await_transfer_futures = lambda futures: (
             MooncakeKVManager._await_transfer_futures(manager, futures)
@@ -254,7 +254,11 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                 failed_batches = []
 
                 def transfer(
-                    session, blocks, src_buffers=src_buffers, dst_buffers=dst_buffers
+                    session,
+                    blocks,
+                    trace_carrier=None,
+                    src_buffers=src_buffers,
+                    dst_buffers=dst_buffers,
                 ):
                     draft_blocks = [block for block in blocks if block[1] >= 3000000]
                     if fail_draft and draft_blocks:
@@ -358,7 +362,7 @@ class TestDcpPackLifetime(CustomTestCase):
         observed = []
         running, release = Event(), Event()
 
-        def transfer(session, blocks):
+        def transfer(session, blocks, trace_carrier=None):
             if blocks[0][0] == 1000:
                 self.assertTrue(running.wait(10))
                 return 17

@@ -251,6 +251,10 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     start_send_idx=prefix,
                     disagg_decode_prefix_len=prefix,
                     disagg_kv_sender=sender,
+                    # Real Request objects always carry this; the PD mm
+                    # token-count divergence diagnostics on the prefill
+                    # send path read it.
+                    multimodal_inputs=None,
                 )
                 scheduler = SimpleNamespace(
                     enable_staging=False,
