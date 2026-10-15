@@ -835,7 +835,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
        fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
-    && kernels lock python \
+    && ( lock_ok=0; \
+         # Same wedge class as the kernels download hardening below: an
+         # hf-mirror outage stalls kernel-status.toml HEAD checks on the SSL
+         # handshake with zero data flow, and once the kernels tool exhausts
+         # its huggingface_hub retries the step goes silent. On 2026-10-15 this
+         # hung kernels lock until the 4h job timeout twice in a row (run
+         # 38730737988). Cap each attempt and fail loudly after the retries —
+         # don't ship an image without kernels.lock: kernel resolution would
+         # then hit the same flaky mirror at server start.
+         for i in 1 2 3; do \
+             echo "Attempt $i/3: locking kernels..." && \
+             timeout 300 kernels lock python && \
+             lock_ok=1 && break; \
+             echo "kernels lock failed, retrying in 30s..." && sleep 30; \
+         done; \
+         [ "$lock_ok" = "1" ] ) \
     && ( success=0; \
          # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
          # Remove this branch once arm cubins are published upstream.
