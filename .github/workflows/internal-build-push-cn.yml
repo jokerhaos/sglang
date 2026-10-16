@@ -49,6 +49,7 @@ on:
   push:
     branches:
       - main
+      - qwen-image2.1
     paths:
       - 'docker/**'
       - 'python/**'

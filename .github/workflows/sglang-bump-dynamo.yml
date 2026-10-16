@@ -1,17 +1,17 @@
 name: Bump dynamo sglang image
 
 # After a successful CU13 sglang build+push (internal-build-push-cn.yml, on
-# main), open/update a PR on astro-web3/dynamo that re-points the
+# main or another configured branch), open/update a PR on the matching
+# branch in astro-web3/dynamo that re-points the
 # sglang.cuda13.0 runtime image in container/context.yaml at the just-pushed
 # ZOT image, pinned to the build's 12-char SHA. The ref written to dynamo uses
 # the registry's EXTERNAL domain (ZOT_PUBLIC_REGISTRY, default orc.0xtoken.cn)
 # — same ZOT as the in-cluster ZOT_REGISTRY — so it resolves from wherever
 # dynamo builds/pulls. base_image / base_image_tag are left alone.
 #
-# Fixed dynamo branch update-sglang-cu13-image = dynamo/main + this one commit;
-# the branch is reset to main each build, so a single, kept-open PR rolls
-# forward to the latest built image. If the image ref is unchanged the commit/push
-# is skipped (no no-op churn).
+# The PR head is a fixed automation branch per target, reset to the matching
+# Dynamo base branch plus one commit each build. If the image ref is unchanged
+# the commit/push is skipped (no no-op churn).
 #
 # The resolved tag is verified in ZOT (manifest HEAD, basic auth) before
 # patching: a dispatch build of only framework_final at that SHA skips with a
@@ -42,15 +42,20 @@ on:
   workflow_run:
     workflows: ["Internal Build & Push (CU13)"]
     types: [completed]
-    branches: [main]
+    branches: [main, qwen-image2.1]
   workflow_dispatch:
     inputs:
       image_tag:
         description: 'sglang-cu13 image tag to pin in dynamo context.yaml (e.g. a 12-char sha)'
         required: true
         type: string
+      dynamo_base:
+        description: 'Dynamo base branch for a manual bump'
+        required: true
+        type: string
+        default: main
 
-# Serialize runs: every run recreates the same dynamo branch off main and
+# Serialize runs: every run recreates the Dynamo branch off its matching base and
 # force-pushes it — two back-to-back bumps must not interleave.
 concurrency:
   group: dynamo-sglang-bump
@@ -66,7 +71,6 @@ env:
   ZOT_REPOSITORY: ${{ vars.ZOT_REPOSITORY != '' && vars.ZOT_REPOSITORY || 'sglang' }}
   GH_PROXY_HOST: ${{ vars.GH_PROXY_HOST != '' && vars.GH_PROXY_HOST || 'gh-proxy.com' }}
   DYNAMO_REPO: astro-web3/dynamo
-  DYNAMO_BRANCH: update-sglang-cu13-image
 
 jobs:
   bump-dynamo:
@@ -81,6 +85,30 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Resolve dynamo target
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          MANUAL_BASE: ${{ inputs.dynamo_base }}
+        run: |
+          set -ueo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            DYNAMO_BASE="${MANUAL_BASE}"
+          else
+            DYNAMO_BASE="${SOURCE_BRANCH}"
+          fi
+          [ -n "${DYNAMO_BASE}" ] || {
+            echo "::error::no Dynamo base branch resolved"
+            exit 1
+          }
+          if [ "${DYNAMO_BASE}" = main ]; then
+            DYNAMO_BRANCH=update-sglang-cu13-image
+          else
+            DYNAMO_BRANCH="update-sglang-cu13-image-${DYNAMO_BASE}"
+          fi
+          echo "DYNAMO_BASE=${DYNAMO_BASE}" >> "$GITHUB_ENV"
+          echo "DYNAMO_BRANCH=${DYNAMO_BRANCH}" >> "$GITHUB_ENV"
+
       - name: Resolve image ref
         id: ref
         shell: bash
@@ -172,22 +200,22 @@ jobs:
             if [ ! -d "$MIRROR/.git" ]; then
               echo "::notice::seeding dynamo mirror — blobless sparse partial clone"
               rm -rf "$MIRROR"
-              retry git clone --no-tags --depth 1 --branch main --filter=blob:none --sparse "$url" "$MIRROR"
+              retry git clone --no-tags --depth 1 --branch "${DYNAMO_BASE}" --filter=blob:none --sparse "$url" "$MIRROR"
               git -C "$MIRROR" sparse-checkout set container
             fi
             retry git -C "$MIRROR" remote set-url origin "$url"
-            retry git -C "$MIRROR" fetch --no-tags --depth 1 origin main
+            retry git -C "$MIRROR" fetch --no-tags --depth 1 origin "${DYNAMO_BASE}"
             git -C "$MIRROR" checkout -f FETCH_HEAD
             git -C "$MIRROR" clean -fdxq
             WORK="$MIRROR"
           else
             echo "no /cache/repos volume — direct full shallow clone via gh-proxy"
             find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-            retry git clone --no-tags --depth 1 --branch main "$url" "$GITHUB_WORKSPACE"
+            retry git clone --no-tags --depth 1 --branch "${DYNAMO_BASE}" "$url" "$GITHUB_WORKSPACE"
             WORK="$GITHUB_WORKSPACE"
           fi
           echo "WORK=${WORK}" >> "$GITHUB_ENV"
-          # (Re)create the fixed branch off main.
+          # (Re)create the fixed automation branch off the matching base.
           git -C "$WORK" checkout -B "${DYNAMO_BRANCH}"
           git -C "$WORK" --no-pager log --oneline -1
 
@@ -264,17 +292,17 @@ jobs:
             exit 0
           fi
           body="$(cat <<EOF
-          Built by \`Internal Build & Push (CU13)\` on main and pushed to ZOT.
+          Built by \`Internal Build & Push (CU13)\` and pushed to ZOT.
 
           - \`sglang.cuda13.0.runtime_image\`     → \`${FULL%:*}\`
           - \`sglang.cuda13.0.runtime_image_tag\` → \`${FULL##*:}\`
           - \`digest\` → \`${DIGEST:-not recorded}\`
 
           \`base_image\` / \`base_image_tag\` left unchanged (dynamo's own build base).
-          The branch \`${DYNAMO_BRANCH}\` is reset to main + this single commit each build, so this PR tracks the latest built image.
+          The branch \`${DYNAMO_BRANCH}\` is reset to \`${DYNAMO_BASE}\` + this single commit each build, so this PR tracks the latest built image.
           EOF
           )"
-          RESP="$(python3 -c "import json,sys; print(json.dumps({'title':'ci(sglang): bump sglang runtime image to ${FULL}','head':'${DYNAMO_BRANCH}','base':'main','body':sys.argv[1]}))" "$body" \
+          RESP="$(python3 -c "import json,sys; print(json.dumps({'title':'ci(sglang): bump sglang runtime image to ${FULL}','head':'${DYNAMO_BRANCH}','base':'${DYNAMO_BASE}','body':sys.argv[1]}))" "$body" \
             | curl -fsSL -X POST "${hdr[@]}" "${api}/pulls" -d @-)"
           PR_URL="$(python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('html_url',''))" <<<"${RESP}")"
           PR_NUM="$(python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('number',''))"  <<<"${RESP}")"
@@ -302,7 +330,7 @@ jobs:
             if [ "${{ steps.verify.outputs.ok }}" = "false" ]; then
               echo "- result: skipped (no runtime image at this SHA — likely a framework_final-only build)"
             fi
-            echo "- dynamo branch: \`${DYNAMO_BRANCH}\` (off current main)"
+            echo "- dynamo branch: \`${DYNAMO_BRANCH}\` (off \`${DYNAMO_BASE}\`)"
             echo "- pushed: \`${{ steps.push.outputs.changed }}\`"
             echo "- repo: https://github.com/${DYNAMO_REPO}"
           } >> "$GITHUB_STEP_SUMMARY"
