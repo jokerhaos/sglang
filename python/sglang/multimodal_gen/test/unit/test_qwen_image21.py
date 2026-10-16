@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
+    QwenImage21DenoisingStage,
     QwenImage21EncodingStage,
     QwenImage21InputValidationStage,
     collapse_image_slots,
@@ -122,6 +123,20 @@ def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_c
     for image in images:
         assert image.mode == "RGBA"
         assert image.getpixel((0, 0)) == (12, 34, 56, 0)
+
+
+def test_denoising_preserves_prefix_caches_when_forward_signature_hides_it():
+    stage = object.__new__(QwenImage21DenoisingStage)
+    stage._extra_func_kwarg_names_cache = {}
+    prefix_caches = [[{}]]
+
+    def wrapped_forward(layouts):
+        return layouts
+
+    kwargs = {"layouts": [], "prefix_caches": prefix_caches}
+    prepared = stage.prepare_extra_func_kwargs(wrapped_forward, kwargs)
+
+    assert prepared["prefix_caches"] is prefix_caches
 
 
 class ConditioningTestEncoder(EncoderTensorParallelMixin, torch.nn.Module):

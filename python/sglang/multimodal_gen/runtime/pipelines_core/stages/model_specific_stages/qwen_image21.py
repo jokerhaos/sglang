@@ -257,6 +257,12 @@ def prepare_qwen21_mu(batch, server_args):
 
 
 class QwenImage21DenoisingStage(DenoisingStage):
+    def prepare_extra_func_kwargs(self, func, kwargs):
+        prepared = super().prepare_extra_func_kwargs(func, kwargs)
+        if "prefix_caches" in kwargs:
+            prepared["prefix_caches"] = kwargs["prefix_caches"]
+        return prepared
+
     def _bcg_pad_prompt_kwargs(
         self, call_kwargs, current_model=None, force_bucket=None
     ):
@@ -273,7 +279,7 @@ class QwenImage21DenoisingStage(DenoisingStage):
         guidance,
         **kwargs,
     ):
-        caches = kwargs["prefix_caches"]
+        caches = kwargs.get("prefix_caches")
         if caches is not None and not caches[0][0]:
             # prefill is request-specific; graph replay must only see populated cache tensors
             return current_model(
