@@ -55,6 +55,7 @@ on:
       - 'python/**'
       - 'rust/**'
       - '.github/workflows/internal-build-push-cn.yml'
+      - 'scripts/ci/utils/install_buildctl.sh'
   workflow_dispatch:
     inputs:
       target:
@@ -249,30 +250,23 @@ jobs:
       #     buildctl is the more robust path. buildctl reads ~/.docker/config.json
       #     and forwards the ZOT creds to buildkitd for the push (verified — the
       #     "[auth] sharing credentials" line in the probe run). buildctl is a
-      #     single static binary fetched once from the gh-proxy GitHub release
-      #     mirror (moby/buildkit v0.33.0, matching buildkitd) and cached under
-      #     ~/.local/bin so later runs skip the download.
-      - name: Install buildctl (cached, via gh-proxy)
+      #     static binary from the matching BuildKit release. Cache its verified
+      #     archive on the shared runner volume; HOME is ephemeral across jobs.
+      - name: Install buildctl (shared cache, resumable download)
         id: install-buildctl
         shell: bash
         run: |
           set -euo pipefail
           VER=v0.33.0
           BIN="$HOME/.local/bin/buildctl-$VER"
-          if [ -x "${BIN}" ]; then
-            echo "buildctl $VER cached at ${BIN}"
-            echo "buildctl=${BIN}" >> "$GITHUB_OUTPUT"; exit 0
+          CACHE_DIR="$HOME/.cache/buildkit/${VER}/linux-amd64"
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            CACHE_DIR="/cache/repos/.ci-tools/buildkit/${VER}/linux-amd64"
           fi
-          mkdir -p "$HOME/.local/bin"
           URL="${GH_PROXY}/https://github.com/moby/buildkit/releases/download/${VER}/buildkit-${VER}.linux-amd64.tar.gz"
-          for i in $(seq 1 8); do
-            curl -fL --connect-timeout 20 --max-time 240 -o /tmp/bk.tgz "${URL}" && break
-            echo "::warning::buildctl download attempt $i; sleep $((i*3))"; sleep $((i*3))
-          done
-          test -s /tmp/bk.tgz
-          tar -xzf /tmp/bk.tgz -C /tmp bin/buildctl
-          install -m 0755 /tmp/bin/buildctl "${BIN}"
-          "${BIN}" --version
+          # GitHub release asset digest for buildkit-v0.33.0.linux-amd64.tar.gz.
+          SHA256=b6242896d343100808dcbe37565caf381e0a444a6a83d7255926bb1519248ead
+          bash scripts/ci/utils/install_buildctl.sh "$URL" "$SHA256" "$CACHE_DIR" "$BIN"
           echo "buildctl=${BIN}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
