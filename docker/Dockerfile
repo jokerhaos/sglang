@@ -807,9 +807,12 @@ ARG GITHUB_ARTIFACTORY
 # 'Network is unreachable'); CI sets this to hf-mirror.com. Empty = use the
 # huggingface.co default (portable).
 ARG HF_ENDPOINT
+ARG HF_HUB_ETAG_TIMEOUT=10
+ARG HF_HUB_DOWNLOAD_TIMEOUT=30
 
 WORKDIR /sgl-workspace
 
+COPY docker/kernel_lock.py /tmp/kernel_lock.py
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
@@ -827,30 +830,30 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/var/cache/sglang-hf,id=sglang-hf-kernels,sharing=locked \
     cd /sgl-workspace/sglang \
+    && export HF_HOME=/var/cache/sglang-hf HF_HUB_ETAG_TIMEOUT HF_HUB_DOWNLOAD_TIMEOUT \
     && if [ -n "${HF_ENDPOINT:-}" ]; then export HF_ENDPOINT; fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
        fi \
-    && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
-    && ( lock_ok=0; \
-         # Same wedge class as the kernels download hardening below: an
-         # hf-mirror outage stalls kernel-status.toml HEAD checks on the SSL
-         # handshake with zero data flow, and once the kernels tool exhausts
-         # its huggingface_hub retries the step goes silent. On 2026-10-15 this
-         # hung kernels lock until the 4h job timeout twice in a row (run
-         # 38730737988). Cap each attempt and fail loudly after the retries —
-         # don't ship an image without kernels.lock: kernel resolution would
-         # then hit the same flaky mirror at server start.
+    # Local-source builds use a generated, checked-in lock. Source-only changes
+    # must not resolve mutable HF metadata again. Refresh after dependency changes
+    # with: python3 docker/kernel_lock.py --update python (kernels must be installed).
+    && if [ "$BRANCH_TYPE" = "local" ]; then \
+         python3 /tmp/kernel_lock.py python; \
+       else \
+         lock_ok=0; \
          for i in 1 2 3; do \
-             echo "Attempt $i/3: locking kernels..." && \
-             timeout 300 kernels lock python && \
-             lock_ok=1 && break; \
-             echo "kernels lock failed, retrying in 30s..." && sleep 30; \
+             echo "Attempt $i/3: locking kernels..."; \
+             timeout 120 kernels lock python && lock_ok=1 && break; \
+             echo "kernels lock failed, retrying in 10s..."; sleep 10; \
          done; \
-         [ "$lock_ok" = "1" ] ) \
+         [ "$lock_ok" = "1" ]; \
+       fi \
+    && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && ( success=0; \
          # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
          # Remove this branch once arm cubins are published upstream.
@@ -858,16 +861,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
              echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
              success=1; \
          else \
-             # 5-min hard cap per attempt: an hf-mirror outage stalls the SSL
+             # 2-min hard cap per attempt: an hf-mirror outage stalls the SSL
              # handshake with zero data flow (pip/git low-speed aborts do not
              # apply to the kernels tool). On 2026-09-23 this hung kernels
              # download until the 4h job timeout instead of falling back to
              # runtime JIT. timeout(124) follows the same failure path as a
-             # normal failed attempt, so the worst case is ~17 min of retries
+             # normal failed attempt, so the worst case is ~7 min of retries
              # before the JIT fallback below.
              for i in 1 2 3; do \
                  echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-                 timeout 300 kernels download python && \
+                 timeout 120 kernels download python && \
                  success=1 && break; \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
@@ -881,6 +884,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
          fi; \
          [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
+    # Cache mounts survive source changes but are not exported in image layers.
+    # Copy the downloaded payloads out so runtime images keep the kernel cache.
+    && cp -a /var/cache/sglang-hf/. /root/.cache/huggingface/ \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 

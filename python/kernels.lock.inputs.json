@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "kernels-community/sgl-flash-attn3": 1
+  },
+  "sha256": "0f36272881d54977044707f8e1559daf2fe4a4fee88dfa6c0f0695e62d7962ce",
+  "generator": "kernels 0.14.1"
+}
