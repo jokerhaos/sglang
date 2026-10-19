@@ -34,8 +34,8 @@ ARG FLASHINFER_VERSION=0.6.18
 # Keep in sync with what the MOONCAKE_FIND_LINKS page hosts: ==0.3.13 does NOT
 # match a 0.3.13.post1 wheel (PEP 440 post-release is a distinct version).
 ARG MOONCAKE_VERSION=0.3.13.post1
-# Native tracing release from the internal wheel publisher (CU13 only).
-ARG MOONCAKE_CUDA13_VERSION=0.3.13.post2
+# Native tracing and event-driven completion release (CU13 only).
+ARG MOONCAKE_CUDA13_VERSION=0.3.13.post3
 # Find-links page serving the mooncake-transfer-engine-cuda13 wheels (internal
 # MinIO). Empty = install straight from the pip index (portable default). When
 # set, the CU13 install resolves from this page ONLY (--no-index --find-links)
