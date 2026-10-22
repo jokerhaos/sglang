@@ -63,3 +63,8 @@ def tree_speculative_sampling_target_only(
         threshold_single,
         threshold_acc,
     )
+
+
+def prewarm_tree_speculative_sampling(vocab_size: int) -> None:
+    """Load the specialization used by EAGLE's deterministic verify sampler."""
+    _jit_sampling_module(math.gcd(4, vocab_size), True)

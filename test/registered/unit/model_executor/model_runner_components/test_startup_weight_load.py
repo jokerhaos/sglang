@@ -3,6 +3,7 @@
 import dataclasses
 import re
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -836,6 +837,40 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "resize",
             ],
         )
+
+    def test_sampling_failure_stops_startup_before_pool_resize(self):
+        for use_draft_worker in (False, True):
+            with self.subTest(use_draft_worker=use_draft_worker):
+                trace = []
+                worker = _SchedulerWorker(trace, post_capture_active=True)
+                failure = RuntimeError("sampling build failed")
+                prewarm = Mock(side_effect=failure)
+                worker.model_runner.prewarm_sampling = prewarm
+                draft_worker = (
+                    SimpleNamespace(hicache_draft_plan=None, prewarm_sampling=prewarm)
+                    if use_draft_worker
+                    else None
+                )
+                scheduler = self._scheduler(
+                    worker, trace, mode="overlap", draft_worker=draft_worker
+                )
+                with (
+                    patch("sglang.srt.managers.scheduler.use_mlx", return_value=False),
+                    patch(
+                        "sglang.srt.managers.scheduler.torch.get_device_module",
+                        return_value=SimpleNamespace(
+                            Stream=lambda priority: object(),
+                            stream=lambda stream: nullcontext(),
+                        ),
+                    ),
+                    patch("sglang.srt.managers.scheduler.prewarm_graph_pool_borrow"),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    scheduler.init_model_worker()
+                self.assertIs(raised.exception, failure)
+                prewarm.assert_called_once_with()
+                worker.model_runner.post_capture_resize_kv_pool.assert_not_called()
+                self.assertNotIn("finalize", trace)
 
     def test_sampling_warmup_uses_the_serving_stream(self):
         for enable_overlap, pp_size, mlx in (

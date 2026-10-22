@@ -221,6 +221,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_cuda,
     is_host_cpu_arm64,
     is_npu,
     require_gathered_buffer,
@@ -1071,7 +1072,48 @@ class ModelRunner:
         )
 
     def prewarm_sampling(self) -> SamplingPrewarmResult:
-        """Warm the sampling path after graph initialization."""
+        """Build and load sampling kernels before the scheduler reports ready."""
+        if (
+            self.device == "cuda"
+            and is_cuda()
+            and self.is_generation
+            and not self.is_draft_worker
+            and (
+                get_exec().kernel.sampling_backend == "flashinfer"
+                # EAGLE verify uses FlashInfer renorm independently of the
+                # regular sampler backend, including standalone drafting.
+                or self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+            )
+        ):
+            from flashinfer.sampling import get_sampling_module
+
+            started = time.perf_counter()
+            logger.info("Building and loading FlashInfer sampling kernels")
+            # Use the same process-local cache as request-time sampling. Let
+            # FlashInfer check disk-cache freshness and propagate build/load
+            # failures so this worker cannot report ready with broken kernels.
+            get_sampling_module()
+            logger.info(
+                "FlashInfer sampling kernels ready in %.3fs",
+                time.perf_counter() - started,
+            )
+
+            if (
+                self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+            ) and not get_spec().speculative_use_rejection_sampling:
+                from sglang.kernels.ops.speculative.sampling import (
+                    prewarm_tree_speculative_sampling,
+                )
+
+                started = time.perf_counter()
+                logger.info("Building and loading EAGLE tree sampling kernel")
+                prewarm_tree_speculative_sampling(self.model_config.vocab_size)
+                logger.info(
+                    "EAGLE tree sampling kernel ready in %.3fs",
+                    time.perf_counter() - started,
+                )
+
         self.sampling_prewarm_result = SamplingPrewarmResult()
         return self.sampling_prewarm_result
 
