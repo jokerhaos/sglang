@@ -34,6 +34,8 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
+    # Must complete before reading asynchronously copied host indices.
+    indices_event: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
