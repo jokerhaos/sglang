@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
@@ -409,6 +410,187 @@ class TestDcpPackLifetime(CustomTestCase):
                 release.set()
             self.assertEqual(future.result(timeout=10), 17)
         self.assertEqual(observed, [11])
+
+
+class TestAsyncHostIndices(CustomTestCase):
+    """Async D2H page indices (official PR #45492).
+
+    The scheduler thread copies page indices into pinned host memory with
+    non_blocking=True and hands the tensor plus a CUDA event to the transfer
+    worker; the worker must wait on the event and convert to NumPy BEFORE
+    any use, never read a half-filled tensor.
+    """
+
+    @staticmethod
+    def _worker_manager():
+        """A shell sufficient for one transfer_worker dispatch iteration."""
+        from collections import defaultdict
+        from threading import Lock
+
+        manager = SimpleNamespace(
+            enable_trace=False,
+            enable_staging=False,
+            enable_deferred_decode_kv_release=False,
+            request_status={},
+            transfer_infos={},
+            req_to_decode_prefix_len={},
+            _staging_outstanding=defaultdict(int),
+            failed_sessions=set(),
+            session_lock=Lock(),
+            is_mla_backend=True,
+            is_hybrid_mla_backend=False,
+            attn_tp_size=1,
+            kv_args=SimpleNamespace(
+                page_size=1,
+                kv_data_ptrs=[1000],
+                engine_rank=0,
+            ),
+            decode_kv_args_table={},
+            bootstrap_port=12345,
+            _prefill_unique_rank=lambda: 1,
+            _maybe_ack_drained_abort=lambda room: None,
+        )
+        from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo
+
+        manager.decode_kv_args_table = {
+            "session": KVArgsRegisterInfo(
+                room="0x707A",
+                endpoint="10.0.0.1",
+                dst_port=1,
+                mooncake_session_id="session",
+                dst_kv_ptrs=[1000],
+                dst_aux_ptrs=[2000],
+                dst_state_data_ptrs=[],
+                dst_tp_rank=0,
+                dst_attn_tp_size=1,
+                dst_kv_item_len=1,
+                dst_state_item_lens=[],
+                dst_state_dim_per_tensor=[],
+                dst_kv_layer_ids=[0],
+                dst_state_layer_ids=[[]],
+            )
+        }
+        manager.check_status = lambda room: manager.request_status[room]
+        manager.update_status = lambda room, status: manager.request_status.__setitem__(
+            room, status
+        )
+        manager.conclude_failure = MagicMock()
+        manager._get_dsa_cache_transfer_skip_flags = (
+            lambda info: (False, False)
+        )
+        manager._should_skip_cp_replicated_state_transfer = lambda: False
+        return manager
+
+    def _chunk(self, indices, room=0x707A, last=True):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.utils import TransferKVChunk
+        from sglang.srt.observability.trace import TraceNullContext
+
+        self._worker_manager  # referenced for clarity
+        manager = self.manager
+        manager.request_status[room] = KVPoll.Bootstrapping
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=indices,
+            index_slice=slice(0, len(indices)),
+            is_last_chunk=last,
+            prefill_aux_index=1,
+            state_indices=None,
+            num_kv_tokens=len(indices),
+            trace_ctx=TraceNullContext(),
+        )
+        return chunk
+
+    def test_worker_sends_indices_after_copy_completes(self):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.utils import FastQueue
+        from sglang.srt.disaggregation.mooncake.conn import TransferInfo
+
+        self.manager = self._worker_manager()
+        manager = self.manager
+
+        host_indices = torch.full((1,), -1, dtype=torch.int32)
+        chunk = self._chunk(host_indices)
+        event = MagicMock()
+        chunk.indices_event = event
+        # synchronize() stands in for the async D2H copy completing.
+        event.synchronize.side_effect = lambda: host_indices.fill_(7)
+
+        # One non-dummy decode endpoint for the room.
+        manager.transfer_infos[chunk.room] = {
+            "session": TransferInfo(
+                room=chunk.room,
+                endpoint="10.0.0.1",
+                dst_port=1,
+                mooncake_session_id="session",
+                dst_kv_indices=np.array([0], dtype=np.int32),
+                dst_aux_index=0,
+                dst_state_indices=[],
+                required_dst_info_num=1,
+                is_dummy=False,
+            )
+        }
+        sent_indices = []
+
+        def transfer(session, indices, *args, **kwargs):
+            self.assertIsInstance(indices, np.ndarray)
+            sent_indices.extend(indices.tolist())
+            return 0
+
+        manager.send_kvcache = transfer
+        manager.send_aux = MagicMock(return_value=0)
+        manager.conclude_transfer = MagicMock()
+
+        queue = FastQueue()
+        queue.put(chunk)
+        queue.put(None)  # stop sentinel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            MooncakeKVManager.transfer_worker(manager, queue, executor)
+
+        self.assertEqual(sent_indices, [7])
+        # The event gate ran before the send, and the tensor is now NumPy.
+        event.synchronize.assert_called_once()
+        manager.conclude_transfer.assert_called_once()
+
+    def test_worker_without_event_keeps_sync_path(self):
+        """Plain NumPy indices without an event must pass through untouched."""
+        from sglang.srt.disaggregation.common.utils import FastQueue
+        from sglang.srt.disaggregation.mooncake.conn import TransferInfo
+
+        self.manager = self._worker_manager()
+        manager = self.manager
+        chunk = self._chunk(np.array([5], dtype=np.int32))
+        manager.transfer_infos[chunk.room] = {
+            "session": TransferInfo(
+                room=chunk.room,
+                endpoint="10.0.0.1",
+                dst_port=1,
+                mooncake_session_id="session",
+                dst_kv_indices=np.array([0], dtype=np.int32),
+                dst_aux_index=0,
+                dst_state_indices=[],
+                required_dst_info_num=1,
+                is_dummy=False,
+            )
+        }
+        sent_indices = []
+
+        def transfer(session, indices, *args, **kwargs):
+            self.assertIsInstance(indices, np.ndarray)
+            sent_indices.extend(indices.tolist())
+            return 0
+
+        manager.send_kvcache = transfer
+        manager.send_aux = MagicMock(return_value=0)
+        manager.conclude_transfer = MagicMock()
+
+        queue = FastQueue()
+        queue.put(chunk)
+        queue.put(None)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            MooncakeKVManager.transfer_worker(manager, queue, executor)
+
+        self.assertEqual(sent_indices, [5])
 
 
 if __name__ == "__main__":
