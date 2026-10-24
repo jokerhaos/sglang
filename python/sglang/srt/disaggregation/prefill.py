@@ -1592,12 +1592,21 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
-            sender.send(
-                page_indices,
-                send_state_indices,
-                num_kv_tokens=seg_end - seg_start,
-                indices_event=indices_event,
-            )
+            # Only the mooncake sender accepts indices_event; the base-class
+            # send() of every other backend has no such kwarg.
+            if indices_event is not None:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                    indices_event=indices_event,
+                )
+            else:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
