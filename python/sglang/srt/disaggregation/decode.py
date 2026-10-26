@@ -444,6 +444,11 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
     host_staged: bool = False
+    # Monotonic timestamp of the first pop_preallocated pass that skipped
+    # this request because its KV reservation did not fit. Ages the
+    # head-of-line bypass so an unfit request cannot be starved by
+    # smaller requests admitted behind it.
+    prealloc_skip_since: Optional[float] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -511,6 +516,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_size = parallel.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        # Head-of-line bypass for prealloc admission: when the FIFO head's
+        # reservation does not fit, scan up to this many later entries for
+        # one that fits (0 keeps the strict-FIFO break). An entry that has
+        # stayed unfit longer than the stall timeout blocks the rest of the
+        # queue so free tokens can accumulate for it.
+        self._prealloc_bypass_window = (
+            envs.SGLANG_DISAGGREGATION_PREALLOC_BYPASS_WINDOW.get()
+        )
+        self._prealloc_bypass_stall_timeout = (
+            envs.SGLANG_DISAGGREGATION_PREALLOC_BYPASS_STALL_TIMEOUT.get()
+        )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -1450,6 +1466,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
         # Then, preallocate the remaining requests if possible
+        skipped_entries = 0
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1624,7 +1641,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
-                break
+                # A reservation that does not fit is a per-request size
+                # problem, not a global exhaustion signal: keep scanning so
+                # smaller requests behind this one can still preallocate.
+                # Bounded by the per-tick window and by aging — an entry
+                # unfit for longer than the stall timeout reverts this pass
+                # to strict FIFO so its room can accumulate.
+                if self._prealloc_bypass_window <= 0:
+                    break
+                if decode_req.prealloc_skip_since is None:
+                    decode_req.prealloc_skip_since = time.monotonic()
+                if (
+                    time.monotonic() - decode_req.prealloc_skip_since
+                    > self._prealloc_bypass_stall_timeout
+                ):
+                    break
+                if skipped_entries >= self._prealloc_bypass_window:
+                    break
+                skipped_entries += 1
+                continue
 
             if swa_allocatable_tokens is not None:
                 reclaim_error = self._reclaim_swa_tail_capacity(
