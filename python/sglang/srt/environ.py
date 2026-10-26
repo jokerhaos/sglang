@@ -702,6 +702,13 @@ class Envs:
     # Retained only to reject the removed setting during startup.
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    # Decode prealloc head-of-line bypass: scan past an entry whose KV
+    # reservation does not fit (0 = strict FIFO break, the historical
+    # behavior). See DecodePreallocQueue.pop_preallocated.
+    SGLANG_DISAGGREGATION_PREALLOC_BYPASS_WINDOW = EnvInt(0)
+    # Revert to strict FIFO once an entry has stayed unfit this many seconds,
+    # so it cannot be starved by smaller requests admitted behind it.
+    SGLANG_DISAGGREGATION_PREALLOC_BYPASS_STALL_TIMEOUT = EnvInt(20)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
