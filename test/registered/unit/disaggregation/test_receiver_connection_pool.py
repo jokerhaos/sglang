@@ -28,8 +28,10 @@ class TestKVFailureEventMetrics(CustomTestCase):
             ):
                 receiver = SimpleNamespace(
                     init_time=95, bootstrap_room=7, abort_notified=True,
-                    kv_mgr=SimpleNamespace(**{threshold: 10}, record_failure=Mock(), update_status=Mock()),
+                    kv_mgr=SimpleNamespace(**{threshold: 10}, record_failure=Mock(), update_status=Mock(), defer_decode_allocation=False, deferred_bootstrap=None),
                     invalidate_cached_bootstrap_infos=Mock(),
+                    # prefill-complete policy start-time override.
+                    _prefill_complete_time=None,
                 )
                 self.assertIsNone(getattr(cls, method)(receiver))
                 events.labels.assert_not_called()
@@ -48,10 +50,12 @@ class TestKVFailureEventMetrics(CustomTestCase):
             ) as events:
                 receiver = SimpleNamespace(
                     bootstrap_room=7, abort_notified=True,
-                    kv_mgr=SimpleNamespace(record_failure=Mock(), update_status=Mock()),
+                    kv_mgr=SimpleNamespace(record_failure=Mock(), update_status=Mock(), deferred_bootstrap=None),
                     # v0.5.21 abort() now ends with ensure_abort_notified();
                     # the event metric test does not exercise the notify path.
                     ensure_abort_notified=lambda **kw: None,
+                    # prefill-complete policy room-ownership gate.
+                    _owns_bootstrap_room=True,
                 )
                 cls.abort(receiver)
                 events.labels.assert_called_once_with(event="abort")

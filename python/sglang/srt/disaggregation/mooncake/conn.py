@@ -2700,8 +2700,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return
         try:
             na = NetworkAddress(notification.decode_ip, notification.decode_port)
-            # Deferred ACKs carry a rank; the feature-off wire format does not.
-            self._send_multipart_locked(
+            # Astro: the legacy ACK rides the same fire-and-forget queue as
+            # the deferred one -- a saturated decode peer must never stall
+            # the bootstrap consumer that used to send it inline
+            # (control-plane wedge, incident EXP-020). A drop degrades to
+            # decode's KV release timeout, never correctness.
+            self._enqueue_control_reply(
                 na.to_tcp(),
                 [ABORT_ACK_TAG, str(room).encode("ascii")],
                 is_ipv6=na.is_ipv6,

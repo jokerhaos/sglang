@@ -119,6 +119,12 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.request_status = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
+        # Early-registration lifecycle state touched by MooncakeKVSender's
+        # tombstone and on_sender_created (see the real MooncakeKVManager
+        # PREFILL branch).
+        mgr._room_lifecycle_lock = threading.Lock()
+        mgr._concluded_rooms = {}
+        mgr._early_rooms = {}
         mgr.waiting_timeout = 5
         mgr.bootstrap_timeout = 3
         mgr.req_to_decode_prefix_len = {}
@@ -441,6 +447,9 @@ class TestAllocationIntegration(CustomTestCase):
         queue.gloo_group = object()
         queue._resolve_pending_reqs = Mock()
         queue._uses_swa_tail_prealloc = Mock(return_value=False)
+        queue._room_to_req = {}  # astro INLEN room tracking (real __init__ owns it)
+        queue._prealloc_bypass_window = 0
+        queue._prealloc_bypass_stall_timeout = 1.0
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             prealloc_fits_assumes_reclaim=Mock(return_value=False)
         )
@@ -505,7 +514,7 @@ class TestAllocationIntegration(CustomTestCase):
             processed_tokens_counter=0,
         )
         with (
-            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
+            patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
@@ -537,13 +546,13 @@ class TestAllocationIntegration(CustomTestCase):
                             has_bootstrapped_waiting_req=Mock(return_value=True),
                             optimistic_release_and_requeue=Mock(),
                         )
-                        scheduler.checkpoint_disagg_prefill = MethodType(
-                            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
+                        scheduler.cache_unfinished_disagg_prefill = MethodType(
+                            SchedulerDisaggregationPrefillMixin.cache_unfinished_disagg_prefill,
                             scheduler,
                         )
                         running = SimpleNamespace(batch_is_full=True)
                         with patch(
-                            "sglang.srt.disaggregation.prefill.checkpoint_kv_cache"
+                            "sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"
                         ):
                             SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
                                 scheduler, None, running
@@ -596,7 +605,7 @@ class TestAllocationIntegration(CustomTestCase):
                 "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
                 side_effect=lambda senders, *groups: [s.poll() for s in senders],
             ),
-            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
+            patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"),
         ):
             self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
             self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
@@ -701,6 +710,8 @@ class TestAllocationIntegration(CustomTestCase):
             is_last_chunk=True,
             state_indices=None,
             prefill_aux_index=0,
+            wait_event=None,
+            indices_event=None,
         )
         mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, None])), None)
         self.assertEqual(cleanup_observed, [1])

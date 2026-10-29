@@ -133,13 +133,21 @@ class TestMooncakeAbortNotification(
 
     def test_feature_off_sends_legacy_ack(self):
         manager = _manager(enabled=False)
+        # Astro: the legacy ACK rides MooncakeKVManager's fire-and-forget
+        # control-reply queue (wedge hardening), not an inline send.
+        queued = []
+        manager._enqueue_control_reply = (
+            lambda endpoint, parts, is_ipv6=False: queued.append((endpoint, parts))
+        )
 
         claimed = manager._handle_abort_notification(self._abort_message())
 
         self.assertTrue(claimed)
         self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-        payload = manager._send_multipart_locked.call_args.args[1]
-        self.assertEqual(payload, [ABORT_ACK_TAG, str(ROOM).encode("ascii")])
+        self.assertEqual(
+            queued,
+            [(f"tcp://{DECODE_IP}:{DECODE_PORT}", [ABORT_ACK_TAG, str(ROOM).encode("ascii")])],
+        )
 
 
 if __name__ == "__main__":

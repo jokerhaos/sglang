@@ -278,7 +278,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    @patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
     def test_ready_observes_accepted_token_and_speculative_sidecars(self, cache):
         scheduler = _Scheduler()
         scheduler.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
