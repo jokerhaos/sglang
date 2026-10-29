@@ -89,7 +89,6 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    _uses_write_through_cache,
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
@@ -1587,24 +1586,6 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
-
-            # Astro: prefill_complete parks unpublished chunks via
-            # UnifiedRadixCache.advance_unpublished_req, which asserts no
-            # mamba component. A write-through tree reaches it for every
-            # chunked request, so fail at startup instead of on the first
-            # request for hybrid-SSM models (e.g. GLM5.3).
-            if (
-                get_disagg().disaggregation_decode_allocation_policy
-                == "prefill_complete"
-                and self.is_hybrid_ssm
-                and _uses_write_through_cache(self.tree_cache)
-            ):
-                raise ValueError(
-                    "prefill_complete + write-through HiCache does not support "
-                    "hybrid-SSM models (advance_unpublished_req cannot publish "
-                    "mamba state). Switch --hicache-write-policy to write_back, "
-                    "which keeps the L3 storage backend."
-                )
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 

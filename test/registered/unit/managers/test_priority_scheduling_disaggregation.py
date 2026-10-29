@@ -277,6 +277,34 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         cache.insert.assert_not_called()
 
+    def test_unpublished_advance_skips_mamba_component(self):
+        # Astro: hybrid-SSM (e.g. GLM5.3) trees carry a MAMBA component whose
+        # prepare/cleanup donate a slot into insert_params — meaningless
+        # without an insert. The unpublished advance must skip it entirely and
+        # leave the request's mamba tracking state untouched.
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        cache, full_component, req = self._new_unpublished_swa_state()
+        full_component.component_type = ComponentType.FULL
+        mamba = MagicMock()
+        mamba.component_type = ComponentType.MAMBA
+        cache._components_tuple = (full_component, mamba)
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.advance_unpublished_req(req, chunked=True)
+
+        # Non-mamba components advance exactly as in the non-mamba tree.
+        full_component.prepare_for_caching_req.assert_called_once()
+        full_component.cleanup_after_caching_req.assert_called_once()
+        full_component.free_out_of_window_slots.assert_called_once()
+        # The mamba component never donates a slot, and no insert happens.
+        mamba.prepare_for_caching_req.assert_not_called()
+        mamba.cleanup_after_caching_req.assert_not_called()
+        mamba.free_out_of_window_slots.assert_not_called()
+        cache.insert.assert_not_called()
+        self.assertFalse(hasattr(req.kv, "mamba_pool_idx"))
+        self.assertTrue(torch.equal(req.prefix_indices, torch.tensor([8, 9, 10, 11])))
+
     def test_bootstrap_failure_after_swa_eviction_releases_once(self):
         cache, component, req = self._new_unpublished_swa_state()
         req.bootstrap_room = 7

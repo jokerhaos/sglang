@@ -1123,7 +1123,19 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "chunked"])
     def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
-        assert not self.supports_mamba()
+        # Astro: this path never inserts into the tree, so the MAMBA
+        # component's donate-a-slot-into-insert_params contract has nothing
+        # to feed. Skip it entirely for hybrid-SSM models: the request keeps
+        # its private mamba state (no intermediate checkpoint while
+        # pending_bootstrap), and the finished/regular insert later donates
+        # from the live state as usual. FULL/SWA still advance their
+        # frontiers and free out-of-window slots, matching the non-mamba
+        # behavior this function had upstream.
+        components = tuple(
+            comp
+            for comp in self._components_tuple
+            if comp.component_type is not ComponentType.MAMBA
+        )
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
@@ -1135,7 +1147,7 @@ class UnifiedRadixCache(BasePrefixCache):
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
+        for comp in components:
             cache_len = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
@@ -1152,11 +1164,11 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=req.cache_salt,
         )
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-            for comp in self._components_tuple:
+            for comp in components:
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-        for comp in self._components_tuple:
+        for comp in components:
             comp.cleanup_after_caching_req(
                 req, is_finished=False, insert_params=insert_params
             )
