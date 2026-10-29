@@ -98,27 +98,32 @@ class TestAllocationConfiguration(CustomTestCase):
                     handle_pd_disaggregation(ServerArgs(**values))
 
     def test_l3_write_through_allowed_via_env_opt_in(self):
-        # Astro: production prefill runs L3 storage + write_through; the
-        # SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 escape hatch admits that
+        # Astro: production prefill runs L3 storage; the
+        # SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 escape hatch admits the L3
         # combination for prefill_complete instead of failing validation.
-        base = dict(
-            model_path="dummy",
-            disaggregation_mode="prefill",
-            disaggregation_decode_allocation_policy="prefill_complete",
-            enable_hierarchical_cache=True,
-            hicache_write_policy="write_through",
-            hicache_storage_backend="mooncake",
-            hicache_host_memory_mode="cache",
-        )
-        with patch.dict(
-            "os.environ", {"SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3": "1"}
-        ):
-            handle_pd_disaggregation(ServerArgs(**base))
-            args = ServerArgs(**base, optimistic_prefill_attempts=2)
-            handle_other_validations(args)
-            self.assertEqual(
-                resolving_view(args).optimistic_prefill_attempts, 2
-            )
+        # write_back is the safe policy for hybrid-SSM models (GLM5.3);
+        # write_through is admitted too (non-SSM models only) because the
+        # scheduler fails fast for the SSM combination at runtime.
+        for policy in ("write_back", "write_through"):
+            with self.subTest(policy=policy):
+                base = dict(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    disaggregation_decode_allocation_policy="prefill_complete",
+                    enable_hierarchical_cache=True,
+                    hicache_write_policy=policy,
+                    hicache_storage_backend="mooncake",
+                    hicache_host_memory_mode="cache",
+                )
+                with patch.dict(
+                    "os.environ", {"SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3": "1"}
+                ):
+                    handle_pd_disaggregation(ServerArgs(**base))
+                    args = ServerArgs(**base, optimistic_prefill_attempts=2)
+                    handle_other_validations(args)
+                    self.assertEqual(
+                        resolving_view(args).optimistic_prefill_attempts, 2
+                    )
 
     def test_l3_write_through_still_rejected_without_env(self):
         base = dict(

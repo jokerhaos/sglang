@@ -481,10 +481,13 @@ def handle_other_validations(server_args: Any):
             or (
                 # Astro: opt-in escape hatch pairing
                 # SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 for prefill_complete.
+                # write_through only stays safe for non-SSM models (the
+                # unpublished-chunk path asserts no mamba); write_back works
+                # for hybrid-SSM models such as GLM5.3.
                 envs.SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3.get()
                 and cfg.hicache_storage_backend is not None
                 and cfg.hicache_host_memory_mode == "cache"
-                and cfg.hicache_write_policy == "write_through"
+                and cfg.hicache_write_policy in ("write_back", "write_through")
             )
         ):
             logger.warning(
