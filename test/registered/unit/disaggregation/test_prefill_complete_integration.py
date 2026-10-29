@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
@@ -95,6 +96,57 @@ class TestAllocationConfiguration(CustomTestCase):
                 values.update(changed)
                 with self.assertRaisesRegex(ValueError, "prefill_complete"):
                     handle_pd_disaggregation(ServerArgs(**values))
+
+    def test_l3_write_through_allowed_via_env_opt_in(self):
+        # Astro: production prefill runs L3 storage + write_through; the
+        # SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 escape hatch admits that
+        # combination for prefill_complete instead of failing validation.
+        base = dict(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_decode_allocation_policy="prefill_complete",
+            enable_hierarchical_cache=True,
+            hicache_write_policy="write_through",
+            hicache_storage_backend="mooncake",
+            hicache_host_memory_mode="cache",
+        )
+        with patch.dict(
+            "os.environ", {"SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3": "1"}
+        ):
+            handle_pd_disaggregation(ServerArgs(**base))
+            args = ServerArgs(**base, optimistic_prefill_attempts=2)
+            handle_other_validations(args)
+            self.assertEqual(
+                resolving_view(args).optimistic_prefill_attempts, 2
+            )
+
+    def test_l3_write_through_still_rejected_without_env(self):
+        base = dict(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_decode_allocation_policy="prefill_complete",
+            enable_hierarchical_cache=True,
+            hicache_write_policy="write_through",
+            hicache_storage_backend="mooncake",
+        )
+        with self.assertRaisesRegex(ValueError, "prefill HiCache"):
+            handle_pd_disaggregation(ServerArgs(**base))
+        # Without the env, optimistic prefill is disabled for L3 cache-mode
+        # write_through, which prefill_complete then rejects upstream of
+        # validation via the dependency check.
+        args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            optimistic_prefill_attempts=2,
+            enable_hierarchical_cache=True,
+            hicache_write_policy="write_through",
+            hicache_storage_backend="mooncake",
+            hicache_host_memory_mode="cache",
+        )
+        handle_other_validations(args)
+        self.assertEqual(
+            resolving_view(args).optimistic_prefill_attempts, 0
+        )
 
 
 class TestAllocationIntegration(CustomTestCase):

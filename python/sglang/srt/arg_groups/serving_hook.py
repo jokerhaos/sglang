@@ -478,6 +478,14 @@ def handle_other_validations(server_args: Any):
                 and cfg.hicache_host_memory_mode == "buffer_only"
                 and cfg.hicache_write_policy == "write_through"
             )
+            or (
+                # Astro: opt-in escape hatch pairing
+                # SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 for prefill_complete.
+                envs.SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3.get()
+                and cfg.hicache_storage_backend is not None
+                and cfg.hicache_host_memory_mode == "cache"
+                and cfg.hicache_write_policy == "write_through"
+            )
         ):
             logger.warning(
                 "Optimistic prefill supports L2 write-back/write-through or "

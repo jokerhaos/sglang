@@ -728,6 +728,12 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Astro: prefill_complete's optimistic-prefill path with a write-through
+    # L3 cache (hicache_storage_backend + hicache_host_memory_mode=cache) is
+    # untested upstream and rejected by validation. Opt in to run it anyway;
+    # the deferred KV lifetime parks chunks in the inflight queue, so L3
+    # write-through ingestion must be observed under load before trusting it.
+    SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

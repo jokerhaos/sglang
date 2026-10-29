@@ -228,6 +228,7 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
     if (
         cfg.disaggregation_mode == "prefill"
         and cfg.enable_hierarchical_cache
+        and not envs.SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3.get()
         and (
             cfg.hicache_storage_backend is not None
             or cfg.hicache_write_policy != "write_back"
