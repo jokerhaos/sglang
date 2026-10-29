@@ -41,6 +41,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.utils import pack_int_lists
+from sglang.srt.disaggregation.common.conn import AckTarget
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -76,6 +77,9 @@ class _WedgeTestManager(MooncakeKVManager):
         self.failure_lock = threading.Lock()
         self._staging_outstanding = {}
         self._deferred_ack_targets = {}
+        self._deferred_ack_poisoned_rooms = set()
+        self._deferred_abort_ack_tracker = {}
+        self._deferred_abort_generation = 0
         self.enable_deferred_decode_kv_release = False
         self.is_mla_backend = False
         self._control_reply_queue = queue.Queue(maxsize=8)
@@ -94,7 +98,6 @@ class _WedgeTestManager(MooncakeKVManager):
         # it because the control-plane paths touch these too.
         self._stopped = False
         self._worker_threads = []
-        self._deferred_ack_fanout_snapshots = {}
         # Early-registration lifecycle bookkeeping (mirrors the real
         # MooncakeKVManager PREFILL branch; see MooncakeKVSender.clear /
         # on_sender_created / sweep_stale_rooms).
@@ -211,16 +214,18 @@ class TestControlReplyQueue(CustomTestCase):
             sent_inline.append((endpoint, parts))
         )
 
-        self.mgr._send_abort_ack("127.0.0.1", 9999, 42)
+        self.mgr._send_abort_ack(42, AckTarget("127.0.0.1", 9999, 7))
 
         self.assertEqual(sent_inline, [])
         endpoint, parts, is_ipv6 = self.mgr._control_reply_queue.get_nowait()
         self.assertEqual(endpoint, "tcp://127.0.0.1:9999")
-        self.assertEqual(parts, [b"ABORT_ACK", b"42", b"0"])
+        self.assertEqual(parts, [b"ABORT_ACK", b"42", b"0", b"7"])
 
     def test_deferred_drain_ack_uses_queue(self):
         self.mgr._send_multipart_locked = None  # any inline send must explode
-        self.mgr._deferred_ack_targets[42] = ("127.0.0.1", 9999)
+        self.mgr._deferred_ack_targets[42] = {
+            ("127.0.0.1", 9999): AckTarget("127.0.0.1", 9999, 7)
+        }
 
         # Quiescent room: the ack must fire immediately, through the queue.
         self.mgr._maybe_ack_drained_abort(42)
@@ -231,13 +236,15 @@ class TestControlReplyQueue(CustomTestCase):
         self.assertEqual(self.mgr._deferred_ack_targets, {})
 
     def test_deferred_drain_ack_deferred_while_outstanding(self):
-        self.mgr._deferred_ack_targets[42] = ("127.0.0.1", 9999)
+        self.mgr._deferred_ack_targets[42] = {
+            ("127.0.0.1", 9999): AckTarget("127.0.0.1", 9999, 7)
+        }
         self.mgr._staging_outstanding[42] = 3  # chunk still in flight
 
         self.mgr._maybe_ack_drained_abort(42)
 
         self.assertTrue(self.mgr._control_reply_queue.empty())
-        self.assertEqual(self.mgr._deferred_ack_targets[42], ("127.0.0.1", 9999))
+        self.assertIn(42, self.mgr._deferred_ack_targets)
 
     def test_enqueue_drop_counting(self):
         self.mgr._control_reply_queue = queue.Queue(maxsize=1)
