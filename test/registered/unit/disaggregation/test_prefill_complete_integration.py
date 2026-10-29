@@ -101,9 +101,9 @@ class TestAllocationConfiguration(CustomTestCase):
         # Astro: production prefill runs L3 storage; the
         # SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 escape hatch admits the L3
         # combination for prefill_complete instead of failing validation.
-        # write_back is the safe policy for hybrid-SSM models (GLM5.3);
-        # write_through is admitted too (non-SSM models only) because the
-        # scheduler fails fast for the SSM combination at runtime.
+        # Both write policies are admitted: the unpublished-chunk path is
+        # mamba-aware in this fork, so hybrid-SSM models (GLM5.3) work with
+        # either.
         for policy in ("write_back", "write_through"):
             with self.subTest(policy=policy):
                 base = dict(

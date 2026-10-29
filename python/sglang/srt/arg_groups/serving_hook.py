@@ -481,9 +481,10 @@ def handle_other_validations(server_args: Any):
             or (
                 # Astro: opt-in escape hatch pairing
                 # SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3 for prefill_complete.
-                # write_through only stays safe for non-SSM models (the
-                # unpublished-chunk path asserts no mamba); write_back works
-                # for hybrid-SSM models such as GLM5.3.
+                # The unpublished-chunk path is mamba-aware in this fork
+                # (advance_unpublished_req skips the MAMBA component), so both
+                # write policies are admitted for L3 cache-mode HiCache,
+                # including hybrid-SSM models such as GLM5.3.
                 envs.SGLANG_DISAGG_ALLOW_PREFILL_COMPLETE_L3.get()
                 and cfg.hicache_storage_backend is not None
                 and cfg.hicache_host_memory_mode == "cache"
